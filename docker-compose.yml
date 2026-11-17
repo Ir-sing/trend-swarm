@@ -1,0 +1,37 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: swarm_db
+    restart: always
+    environment:
+      POSTGRES_USER: swarm_admin
+      POSTGRES_PASSWORD: swarm_password
+      POSTGRES_DB: trend_swarm
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U swarm_admin -d trend_swarm"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  swarm_app:
+    # Для работы через 'docker compose pull' раскомментируй строку image со своим GitHub-аккаунтом:
+    # image: ghcr.io/ваш_гитхаб_аккаунт/trend-swarm:latest
+    build: .
+    container_name: swarm_backend
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://swarm_admin:swarm_password@db:5432/trend_swarm
+    volumes:
+      - ./app:/code/app
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
