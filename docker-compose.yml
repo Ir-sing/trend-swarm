@@ -18,8 +18,7 @@ services:
       retries: 10
 
   swarm_app:
-    # Для работы через 'docker compose pull' раскомментируй строку image со своим GitHub-аккаунтом:
-    # image: ghcr.io/ваш_гитхаб_аккаунт/trend-swarm:latest
+    image: ghcr.io/Ir-sing/trend-swarm:latest
     build: .
     container_name: swarm_backend
     restart: always
