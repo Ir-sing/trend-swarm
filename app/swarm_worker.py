@@ -42,7 +42,7 @@ class AutonomousScout:
             except Exception as e:
                 async with AsyncSessionLocal() as db:
                     await update_agent_telemetry(db, self.agent_id, "SCOUT", "ERROR", "-", f"Сбой: {str(e)[:100]}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(4)
 
         async with AsyncSessionLocal() as db:
             await update_agent_telemetry(db, self.agent_id, "SCOUT", "STOPPED", "-", "Остановлен")
@@ -72,13 +72,13 @@ class AutonomousScout:
 
             try:
                 q = signal.search_queries[0] if signal.search_queries else ""
-                await update_agent_telemetry(db, self.agent_id, "SCOUT", "CROSS_CHECKING", resource.name, f"Проверка сигнала '{signal.signal_summary[:40]}...' в [{target_block}]")
+                await update_agent_telemetry(db, self.agent_id, "SCOUT", "CROSS_CHECKING", resource.name, f"Проверка сигнала '{signal.signal_summary[:40]}...' в [{target_block}] (из кеша)")
                 items = await ResourceConnectorEngine.fetch(db, resource, search_query=q)
                 checked = list(signal.checked_by_blocks)
                 checked.append(target_block)
                 signal.checked_by_blocks = checked
                 if items:
-                    sample_text = " | ".join([i["text"][:200] for i in items[:5]])
+                    sample_text = " | ".join([i["text"][:200] for i in items[:4]])
                     analysis = await DynamicModelRouter.ask_agent(db, "dirty_scout", f"Сигнал: {signal.signal_summary}. Найдено в {resource.name}: {sample_text}")
                     if analysis.get("confirmed", False):
                         conf = list(signal.confirmations)
@@ -104,8 +104,8 @@ class AutonomousScout:
         )
         resource = (await db.execute(stmt)).scalars().first()
         if not resource:
-            await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", "-", "Ожидание свободных URL...")
-            await asyncio.sleep(3)
+            await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", "-", "Все активные URL проверены (Режим экономии трафика и токенов)...")
+            await asyncio.sleep(6)
             return
 
         resource.locked_by_agent = self.agent_id
@@ -114,34 +114,36 @@ class AutonomousScout:
 
         try:
             tags_str = ", ".join(resource.tags or [])
-            await update_agent_telemetry(db, self.agent_id, "SCOUT", "CRAWLING", resource.name, f"Парсинг [{resource.connector_type}] ({resource.geo_region}) {tags_str}")
+            await update_agent_telemetry(db, self.agent_id, "SCOUT", "CRAWLING", resource.name, f"Запрос [{resource.connector_type}] ({resource.geo_region}) {tags_str}")
             items = await ResourceConnectorEngine.fetch(db, resource)
             resource.last_crawled_at = utcnow()
             resource.fail_count = 0
             resource.health_status = "HEALTHY"
 
             if not items:
-                resource.temperature = max(15.0, round(resource.temperature * 0.92, 1))
-                resource.cooldown_until = utcnow() + timedelta(minutes=5)
+                # Если вернулся 304 Not Modified или пусто — ставим паузу 15 минут (0 байт и 0 токенов)
+                resource.temperature = max(15.0, round(resource.temperature * 0.95, 1))
+                resource.cooldown_until = utcnow() + timedelta(minutes=15)
+                await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", resource.name, "304 Not Modified / Новых данных нет (0 байт / 0 токенов)")
                 return
 
-            combined_text = " \n ".join([f"[{i['author_id']}]: {i['text']}" for i in items[:8]])
+            combined_text = " \\n ".join([f"[{i['author_id']}]: {i['text']}" for i in items[:8]])
             content_hash = hashlib.md5(combined_text[:1500].encode("utf-8")).hexdigest()
             if resource.last_content_hash == content_hash:
-                resource.cooldown_until = utcnow() + timedelta(minutes=10)
-                await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", resource.name, "Новых постов нет — пропуск LLM (0 токенов)")
+                resource.cooldown_until = utcnow() + timedelta(minutes=20)
+                await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", resource.name, "Контент не изменился — пропуск LLM (Пауза 20 мин)")
                 return
             resource.last_content_hash = content_hash
 
             first_img = next((i["image_url"] for i in items if i.get("image_url")), None)
             role = "vision_meme" if first_img else "dirty_scout"
 
-            await update_agent_telemetry(db, self.agent_id, "SCOUT", "ANALYZING", resource.name, f"Анализ {len(items)} новых записей ролью [{role}]...", inc_items=len(items))
-            analysis = await DynamicModelRouter.ask_agent(db, role, f"Источник: {resource.name} ({resource.geo_region}). Данные:\n{combined_text[:3000]}", image_url=first_img)
+            await update_agent_telemetry(db, self.agent_id, "SCOUT", "ANALYZING", resource.name, f"Анализ {len(items)} свежих записей ролью [{role}]...", inc_items=len(items))
+            analysis = await DynamicModelRouter.ask_agent(db, role, f"Источник: {resource.name} ({resource.geo_region}). Данные:\\n{combined_text[:2500]}", image_url=first_img)
 
             if analysis.get("is_anomaly", False):
                 resource.temperature = min(100.0, round(resource.temperature + 15.0, 1))
-                resource.cooldown_until = utcnow() + timedelta(minutes=2)
+                resource.cooldown_until = utcnow() + timedelta(minutes=10)
                 vec = DynamicModelRouter.compute_fast_vector(analysis.get("essence", combined_text[:200]))
                 new_sig = SwarmBlackboard(
                     source_resource_name=resource.name,
@@ -155,12 +157,12 @@ class AutonomousScout:
                 await self.record_to_memory(db, new_sig, resource.geo_region, is_mainstream=False)
             else:
                 resource.temperature = max(15.0, round(resource.temperature * 0.95, 1))
-                resource.cooldown_until = utcnow() + timedelta(minutes=5)
+                resource.cooldown_until = utcnow() + timedelta(minutes=20)
         except Exception as err:
             resource.fail_count = (resource.fail_count or 0) + 1
             resource.last_error = str(err)[:200]
             resource.health_status = "DEGRADED"
-            resource.cooldown_until = utcnow() + timedelta(minutes=3)
+            resource.cooldown_until = utcnow() + timedelta(minutes=10)
         finally:
             resource.locked_by_agent = None
             await db.commit()
@@ -220,8 +222,8 @@ class ForemanAgent:
                             low_t, starving_name = avg_t, b.name
                         if avg_t < 45.0:
                             for r in r_list:
-                                r.temperature = min(95.0, round(r.temperature + 20.0, 1))
-                                r.cooldown_until = None
+                                r.temperature = min(90.0, round(r.temperature + 15.0, 1))
+                                # ВАЖНО: Не сбрасываем cooldown_until, чтобы не провоцировать лишний сетевой трафик!
                     active_sigs = (await db.execute(select(SwarmBlackboard).where(SwarmBlackboard.status == "ACTIVE"))).scalars().all()
                     for sig in active_sigs:
                         sig.priority_boost = round((sig.priority_boost or 1.0) + 0.5, 1)
@@ -230,7 +232,7 @@ class ForemanAgent:
                 break
             except Exception as e:
                 print(f"⚠️ Foreman error: {e}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(20)
 
 class ReanimatorAgent:
     def __init__(self, controller: "SwarmController"):
@@ -247,17 +249,17 @@ class ReanimatorAgent:
                         if r.locked_by_agent and r.locked_at and (now - r.locked_at).total_seconds() > 90:
                             r.locked_by_agent, r.locked_at = None, None
                             locks += 1
-                        if r.health_status == "DEGRADED" or (r.fail_count and r.fail_count >= 2):
-                            r.health_status, r.fail_count, r.cooldown_until = "REANIMATING", 0, None
-                            r.temperature = max(65.0, r.temperature)
+                        if r.health_status == "DEGRADED" or (r.fail_count and r.fail_count >= 3):
+                            r.health_status, r.fail_count = "REANIMATING", 0
+                            r.cooldown_until = now + timedelta(minutes=15)
                             healed += 1
                     revived = await self.controller.ensure_scouts_alive()
-                    await update_agent_telemetry(db, self.agent_id, "REANIMATOR", "HEALING", "Инфраструктура & Пул Ищеек", f"Снято зомби-локов: {locks} | Восстановлено URL: {healed} | Поднято ищеек: {revived}", inc_items=locks+healed+revived)
+                    await update_agent_telemetry(db, self.agent_id, "REANIMATOR", "HEALING", "Инфраструктура & Трафик-контроль", f"Снято зомби-локов: {locks} | Переведено в щадящий режим: {healed} | Поднято ищеек: {revived}", inc_items=locks+healed+revived)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 print(f"⚠️ Reanimator error: {e}")
-            await asyncio.sleep(12)
+            await asyncio.sleep(20)
 
 class MemoryAnalystAgent:
     def __init__(self, controller: "SwarmController"):
@@ -272,7 +274,7 @@ class MemoryAnalystAgent:
                     trends = (await db.execute(select(TrendMemory).where(TrendMemory.lifecycle_status != "IGNORED_NOISE"))).scalars().all()
                     if not trends:
                         await update_agent_telemetry(db, self.agent_id, "MEMORY_ANALYST", "IDLE", "Файл Памяти (0)", "Ожидание первых сигналов...")
-                        await asyncio.sleep(8)
+                        await asyncio.sleep(15)
                         continue
 
                     for tr in trends:
@@ -291,16 +293,16 @@ class MemoryAnalystAgent:
                     state_sig = "|".join([f"{t.code}:{len(t.delta_history or [])}" for t in sorted(trends, key=lambda x: x.code)])
                     state_hash = hashlib.md5(state_sig.encode("utf-8")).hexdigest()
                     if self.last_state_hash == state_hash:
-                        await update_agent_telemetry(db, self.agent_id, "MEMORY_ANALYST", "IDLE", f"Файл Памяти ({len(trends)} трендов)", "Z-Score и производные пересчитаны (Новых дельт нет — 0 токенов)")
-                        await asyncio.sleep(15)
+                        await update_agent_telemetry(db, self.agent_id, "MEMORY_ANALYST", "IDLE", f"Файл Памяти ({len(trends)} трендов)", "Z-Score пересчитан (Новых дельт нет — 0 байт / 0 токенов)")
+                        await asyncio.sleep(20)
                         continue
                     self.last_state_hash = state_hash
 
                     if len(trends) >= 2:
                         top_t = sorted(trends, key=lambda x: x.acceleration_rate, reverse=True)[:8]
-                        dump = "\n".join([f"- [{t.code}] (Z={t.z_score}, V={t.velocity}, Score={t.acceleration_rate}): {t.title} | {t.core_essence}" for t in top_t])
+                        dump = "\\n".join([f"- [{t.code}] (Z={t.z_score}, V={t.velocity}, Score={t.acceleration_rate}): {t.title} | {t.core_essence}" for t in top_t])
                         await update_agent_telemetry(db, self.agent_id, "MEMORY_ANALYST", "SYNTHESIZING", f"Файл Памяти ({len(trends)} трендов)", "Сшивка кросс-трендовых инвестиционных гипотез...", inc_items=len(top_t))
-                        meta_res = await DynamicModelRouter.ask_agent(db, "memory_analyst", f"Свяжи тренды из Файла Памяти в инвестиционную гипотезу:\n{dump}")
+                        meta_res = await DynamicModelRouter.ask_agent(db, "memory_analyst", f"Свяжи тренды из Файла Памяти в инвестиционную гипотезу:\\n{dump}")
                         codes = meta_res.get("linked_codes") or [t.code for t in top_t[:3]]
                         title = meta_res.get("title") or f"Мета-связка: {' + '.join(codes)} ({top_t[0].title[:35]})"
                         if not (await db.execute(select(MetaInsight).where(MetaInsight.title == title))).scalars().first():
@@ -315,7 +317,7 @@ class MemoryAnalystAgent:
                 break
             except Exception as e:
                 print(f"⚠️ MemoryAnalyst error: {e}")
-            await asyncio.sleep(15)
+            await asyncio.sleep(20)
 
 class SwarmController:
     def __init__(self):
