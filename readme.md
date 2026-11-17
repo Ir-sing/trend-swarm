@@ -5,7 +5,6 @@
 [![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/Docker-Enabled-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://github.com/pgvector/pgvector)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **trend-swarm** — это масштабируемый бэкенд на Python, который разворачивает команду автономных агентов (`AutonomousScout`) для мониторинга источников данных, семантического анализа контента и построения математических моделей трендов. Система использует динамическую маршрутизацию LLM (`DynamicModelRouter`) и векторную базу данных для накопления "памяти" и обмена сигналами между агентами через общую доску (`SwarmBlackboard`).
