@@ -18,7 +18,7 @@ services:
       retries: 10
 
   swarm_app:
-    image: ghcr.io/Ir-sing/trend-swarm:latest
+    image: ghcr.io/ir-sing/trend-swarm:latest
     build: .
     container_name: swarm_backend
     restart: always
