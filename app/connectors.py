@@ -13,8 +13,9 @@ class ResourceConnectorEngine:
     _http_validators: dict[str, dict] = {}
     _items_cache: dict[int, tuple[float, list[dict]]] = {}
 
-    MAX_RESPONSE_BYTES = 220_000
-    CACHE_TTL_SECONDS = 900
+    MAX_RESPONSE_BYTES = 180_000  # Жесткий лимит 180 КБ на страницу (экономия гигабайтов трафика)
+    CACHE_TTL_SECONDS = 1200      # 20 минут жизни локального кеша
+    MAX_CACHE_KEYS = 250          # Защита от утечки оперативной памяти при работе 24/7
 
     @classmethod
     def get_client(cls, proxy_url: str = "") -> httpx.AsyncClient:
@@ -23,7 +24,7 @@ class ResourceConnectorEngine:
             kwargs = {
                 "timeout": 15.0,
                 "follow_redirects": True,
-                "limits": httpx.Limits(max_keepalive_connections=25, max_connections=50, keepalive_expiry=60.0),
+                "limits": httpx.Limits(max_keepalive_connections=20, max_connections=40, keepalive_expiry=60.0),
                 "headers": {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
                     "Accept-Encoding": "gzip, deflate"
@@ -36,10 +37,13 @@ class ResourceConnectorEngine:
 
     @classmethod
     async def fetch_raw_capped(cls, url: str, params: dict = None, extra_headers: dict = None, use_304: bool = True, proxy_url: str = "") -> tuple[int, bytes]:
+        if len(cls._http_validators) > cls.MAX_CACHE_KEYS:
+            cls._http_validators.clear()
+
         client = cls.get_client(proxy_url)
         req_headers = dict(extra_headers or {})
         if "reddit.com" in url:
-            req_headers["User-Agent"] = "linux:trend.swarm.analytics:v2.3 (by /u/trend_research_bot)"
+            req_headers["User-Agent"] = "linux:trend.swarm.analytics:v2.4 (by /u/trend_research_bot)"
 
         cache_key = f"{url}?{json.dumps(params, sort_keys=True)}" if params else url
         if use_304 and cache_key in cls._http_validators:
@@ -78,13 +82,16 @@ class ResourceConnectorEngine:
     @classmethod
     async def fetch(cls, db: AsyncSession, resource: Resource, search_query: str = None) -> list[dict]:
         now = time.time()
+        if len(cls._items_cache) > cls.MAX_CACHE_KEYS:
+            cls._items_cache = {k: v for k, v in cls._items_cache.items() if (now - v[0]) < cls.CACHE_TTL_SECONDS}
+
+        # Если есть свежий локальный кеш — при перекрестной проверке (search_query) ищем строго реальные совпадения без скачивания сайта!
         if resource.id in cls._items_cache:
             cached_time, cached_items = cls._items_cache[resource.id]
             if (now - cached_time) < cls.CACHE_TTL_SECONDS:
                 if search_query:
                     q_low = search_query.lower()
-                    matched = [i for i in cached_items if q_low in i["text"].lower()]
-                    return matched if matched else cached_items[:4]
+                    return [i for i in cached_items if q_low in i["text"].lower()]
                 return cached_items
 
         proxy_cred = await cls.get_credentials(db, "proxies")
@@ -94,12 +101,11 @@ class ResourceConnectorEngine:
         cfg = resource.connector_config or {}
         items = []
 
-        # 1. ВАКАНСИИ HH.RU
         if ctype == "hh_vacancies":
             text_filter = search_query or cfg.get("search_text", "технолог пищевого производства OR FMCG")
             status, raw_bytes = await cls.fetch_raw_capped(
                 resource.url_or_id,
-                params={"text": text_filter, "per_page": 8, "order_by": "publication_time"},
+                params={"text": text_filter, "per_page": 6, "order_by": "publication_time"},
                 use_304=(search_query is None),
                 proxy_url=proxy_url
             )
@@ -108,16 +114,15 @@ class ResourceConnectorEngine:
                 items = [{
                     "author_id": v.get("employer", {}).get("name", "company"),
                     "text": f"Компания: {v.get('employer', {}).get('name')}. Вакансия: {v.get('name')}. Требования: {v.get('snippet', {}).get('requirement')}"
-                } for v in data.get("items", [])[:8]]
+                } for v in data.get("items", [])[:6]]
 
-        # 2. WILDBERRIES / MPSTATS
         elif ctype == "wb_mpstats":
             cred = await cls.get_credentials(db, "wb_mpstats")
             if cred and cred.api_key_or_token:
                 status, raw_bytes = await cls.fetch_raw_capped(resource.url_or_id, extra_headers={"X-Mpstats-TOKEN": cred.api_key_or_token}, proxy_url=proxy_url)
                 if status == 200 and raw_bytes:
                     data = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
-                    items = [{"author_id": "wb_mpstats", "text": str(item)} for item in data[:10]]
+                    items = [{"author_id": "wb_mpstats", "text": str(item)} for item in data[:8]]
             else:
                 q = search_query or cfg.get("default_query", "напиток клетчатка протеин снек")
                 wb_url = f"https://search.wb.ru/exactmatch/ru/common/v7/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={q}&resultset=catalog&sort=Newly"
@@ -127,32 +132,26 @@ class ResourceConnectorEngine:
                     items = [{
                         "author_id": p.get("brand", "seller"),
                         "text": f"Новинка WB: {p.get('name')} | Бренд: {p.get('brand')} | Отзывов: {p.get('feedbacks')}"
-                    } for p in data.get("data", {}).get("products", [])[:10]]
+                    } for p in data.get("data", {}).get("products", [])[:8]]
 
-        # 3. TELEGRAM (Текстовая фиксация наличия фото/мема/видео и просмотров без скачивания файлов)
         elif ctype == "telegram_web":
             status, raw_bytes = await cls.fetch_raw_capped(resource.url_or_id, use_304=True, proxy_url=proxy_url)
             if status == 200 and raw_bytes:
                 soup = BeautifulSoup(raw_bytes.decode("utf-8", errors="ignore"), "html.parser")
-                for msg in soup.select(".tgme_widget_message")[-10:]:
+                for msg in soup.select(".tgme_widget_message")[-8:]:
                     t_el = msg.select_one(".tgme_widget_message_text")
-                    has_photo = bool(msg.select_one(".tgme_widget_message_photo_wrap"))
-                    has_video = bool(msg.select_one(".tgme_widget_message_video_thumb, video"))
                     views_el = msg.select_one(".tgme_widget_message_views")
-
-                    media_type = "Формат: Видеоролик. " if has_video else ("Формат: Мем/Картинка. " if has_photo else "")
                     views_str = f" (Просмотров: {views_el.get_text(strip=True)})" if views_el else ""
                     if t_el:
                         items.append({
                             "author_id": msg.get("data-post", "tg"),
-                            "text": f"{media_type}{t_el.get_text(' ', strip=True)}{views_str}"[:550]
+                            "text": f"{t_el.get_text(' ', strip=True)}{views_str}"[:500]
                         })
 
-        # 4. ФОРУМЫ И ИМИДЖБОРДЫ (Текстовое извлечение названий мемов, имен видеофайлов и охватов)
         elif ctype == "json_api":
             url = resource.url_or_id
             if "reddit.com" in url and "limit=" not in url:
-                url = f"{url}?limit=8&raw_json=1"
+                url = f"{url}?limit=6&raw_json=1"
             if "2ch.hk" in url:
                 url = url.replace("catalog.json", "index.json").replace("threads.json", "index.json")
 
@@ -162,11 +161,11 @@ class ResourceConnectorEngine:
                 r_status, r_bytes = await cls.fetch_raw_capped(rss_url, use_304=True, proxy_url=proxy_url)
                 if r_status == 200 and r_bytes:
                     feed = feedparser.parse(r_bytes.decode("utf-8", errors="ignore"))
-                    for e in feed.entries[:8]:
+                    for e in feed.entries[:6]:
                         entry_soup = BeautifulSoup(e.get("summary", ""), "html.parser")
                         items.append({
                             "author_id": e.get("author", "redditor"),
-                            "text": f"{e.get('title', '')}. {entry_soup.get_text(' ', strip=True)[:400]}"
+                            "text": f"{e.get('title', '')}. {entry_soup.get_text(' ', strip=True)[:380]}"
                         })
             elif status == 200 and raw_bytes:
                 try:
@@ -175,60 +174,48 @@ class ResourceConnectorEngine:
                     data = {}
 
                 if isinstance(data, dict) and "data" in data and "children" in data["data"]:
-                    for post in data["data"]["children"][:8]:
+                    for post in data["data"]["children"][:6]:
                         pd = post.get("data", {})
-                        is_vid = pd.get("is_video", False)
-                        flair = pd.get("link_flair_text") or ""
-                        prefix = f"[Видеоролик {flair}] " if is_vid else (f"[{flair}] " if flair else "")
                         items.append({
                             "author_id": pd.get("author", "redditor"),
-                            "text": f"{prefix}{pd.get('title', '')}. {pd.get('selftext', '')[:380]}"
+                            "text": f"{pd.get('title', '')}. {pd.get('selftext', '')[:360]}"
                         })
                 elif isinstance(data, dict) and "threads" in data:
-                    for th in data["threads"][:10]:
+                    for th in data["threads"][:8]:
                         op = th["posts"][0] if ("posts" in th and th["posts"]) else th
                         txt = BeautifulSoup(op.get("comment", ""), "html.parser").get_text(" ", strip=True)
                         files = op.get("files", [])
-                        # Извлекаем текстовое имя файла мема или видео без его скачивания!
                         file_names = [f.get("fullname") or f.get("displayname") or "" for f in files if f.get("fullname") or f.get("displayname")]
-                        media_desc = f"[Медиафайл: {', '.join(file_names[:2])}] " if file_names else ""
+                        media_desc = f"[Медиа: {', '.join(file_names[:2])}] " if file_names else ""
                         items.append({
                             "author_id": str(op.get("num", "anon")),
-                            "text": f"{media_desc}{op.get('subject', '')}: {txt[:400]}"
+                            "text": f"{media_desc}{op.get('subject', '')}: {txt[:360]}"
                         })
 
-        # 5. RSS / ATOM (Считываем текстовые описания и заголовки мемов/новостей)
         elif ctype == "rss_feed":
             status, raw_bytes = await cls.fetch_raw_capped(resource.url_or_id, use_304=True, proxy_url=proxy_url)
             if status == 200 and raw_bytes:
                 feed = feedparser.parse(raw_bytes.decode("utf-8", errors="ignore"))
-                for entry in feed.entries[:10]:
+                for entry in feed.entries[:8]:
                     s_soup = BeautifulSoup(entry.get("summary", ""), "html.parser")
-                    # Если внутри есть картинки с текстовым alt-описанием мема — забираем этот текст!
-                    alts = [img.get("alt", "").strip() for img in s_soup.select("img[alt]") if len(img.get("alt", "").strip()) > 5]
-                    alt_prefix = f"[Описание картинки/мема: {alts[0]}] " if alts else ""
                     summary = s_soup.get_text(" ", strip=True)
-                    full = f"{entry.get('title', '')}. {alt_prefix}{summary}"
-                    items.append({"author_id": entry.get("author", resource.name), "text": full[:550]})
+                    full = f"{entry.get('title', '')}. {summary}"
+                    items.append({"author_id": entry.get("author", resource.name), "text": full[:480]})
 
-        # 6. HTML-СКРЕЙПЕР (Считываем текст и alt-подписи картинок как обычный текст)
         elif ctype == "html_scraper":
             status, raw_bytes = await cls.fetch_raw_capped(resource.url_or_id, use_304=True, proxy_url=proxy_url)
             if status == 200 and raw_bytes:
                 soup = BeautifulSoup(raw_bytes.decode("utf-8", errors="ignore"), "html.parser")
                 sel = cfg.get("item_selector", "article, .item, .news-item, .comment_text, p")
-                for el in soup.select(sel)[:10]:
+                for el in soup.select(sel)[:8]:
                     txt = el.get_text(" ", strip=True)
-                    if len(txt) > 40:
-                        img_alt = el.select_one("img[alt]")
-                        alt_str = f" [Визуал: {img_alt.get('alt').strip()}]" if (img_alt and len(img_alt.get("alt", "").strip()) > 5) else ""
-                        items.append({"author_id": resource.name, "text": f"{txt[:480]}{alt_str}"})
+                    if len(txt) > 45:
+                        items.append({"author_id": resource.name, "text": txt[:450]})
 
         if items:
             cls._items_cache[resource.id] = (now, items)
 
         if search_query and items:
             q_low = search_query.lower()
-            matched = [i for i in items if q_low in i["text"].lower()]
-            return matched
+            return [i for i in items if q_low in i["text"].lower()]
         return items
