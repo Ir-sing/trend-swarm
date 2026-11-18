@@ -11,7 +11,7 @@ from app.models import (
     ConnectorCredential, AgentTelemetry, SwarmBlackboard, MetaInsight, UserAuditLog
 )
 from app.seed import seed_initial_data
-from app.swarm_worker import swarm_controller
+from app.swarm_worker import swarm_controller, utcnow
 from app.math_engine import TrendMathEngine
 
 
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE trend_memory ADD COLUMN IF NOT EXISTS z_score FLOAT DEFAULT 0.0"))
     async with AsyncSessionLocal() as db:
         await seed_initial_data(db)
-        await log_user_action(db, "SYSTEM", "SERVER_START", "Проект Улей", "Сервер запущен, API приёма инсайтов Гермеса активен")
+        await log_user_action(db, "SYSTEM", "SERVER_START", "Проект Улей", "Сервер запущен, POST-запись в память открыта")
     await swarm_controller.start(scout_count=4)
     yield
     await swarm_controller.stop()
@@ -56,10 +56,122 @@ class RoleConfigSchema(BaseModel):
 
 
 # =====================================================================
-# 1. API ДЛЯ ГЕРМЕСА (ЧТЕНИЕ ДАЙДЖЕСТА, ПОИСК И POST-ЗАПИСЬ ИНСАЙТОВ В БАЗУ)
+# 1. ОТКРЫТАЯ POST-ЗАПИСЬ ИНСАЙТОВ И ТРЕНДОВ В БАЗУ (ДЛЯ ГЕРМЕСА)
 # =====================================================================
-@app.get("/api/hermes/digest", tags=["Hermes API"])
-@app.get("/api/digest", tags=["Hermes API"])
+@app.post("/api/memory/meta-insights", tags=["Hermes Read/Write API"])
+@app.post("/api/hermes/ingest-insight", tags=["Hermes Read/Write API"])
+@app.post("/api/ingest-insight", tags=["Hermes Read/Write API"])
+@app.post("/api/hermes/ingest", tags=["Hermes Read/Write API"])
+@app.post("/api/ingest", tags=["Hermes Read/Write API"])
+@app.post("/api/hermes/insights", tags=["Hermes Read/Write API"])
+@app.post("/api/insights", tags=["Hermes Read/Write API"])
+async def hermes_write_meta_insight(
+    request: Request,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """Разрешает POST-запись инсайтов на /api/memory/meta-insights и все пути /api/hermes/*"""
+    title = (
+        payload.get("title")
+        or payload.get("name")
+        or payload.get("topic")
+        or payload.get("heading")
+        or "Инсайт от агента Гермес"
+    )
+    summary = (
+        payload.get("consumer_pain_summary")
+        or payload.get("summary")
+        or payload.get("description")
+        or payload.get("essence")
+        or payload.get("content")
+        or payload.get("text")
+        or str(payload)
+    )
+    thesis = (
+        payload.get("investment_or_product_thesis")
+        or payload.get("investment_thesis")
+        or payload.get("thesis")
+        or payload.get("insight")
+        or payload.get("recommendation")
+        or payload.get("conclusion")
+        or "Структурированный вывод записан агентом Гермес."
+    )
+    codes = (
+        payload.get("linked_trend_codes")
+        or payload.get("linked_codes")
+        or payload.get("trends")
+        or payload.get("codes")
+        or []
+    )
+    if isinstance(codes, str):
+        codes = [c.strip() for c in codes.split(",") if c.strip()]
+
+    score = float(payload.get("confidence_score") or payload.get("confidence") or payload.get("score") or 0.9)
+
+    new_insight = MetaInsight(
+        title=str(title)[:200],
+        linked_trend_codes=codes if isinstance(codes, list) else [],
+        pattern_type=str(payload.get("pattern_type", "HERMES_INGEST")),
+        consumer_pain_summary=str(summary),
+        investment_or_product_thesis=str(thesis),
+        confidence_score=score
+    )
+    db.add(new_insight)
+    await db.commit()
+    await db.refresh(new_insight)
+
+    client_ip = request.client.host if request.client else "Hermes"
+    await log_user_action(db, f"Hermes ({client_ip})", "HERMES_WRITE_INSIGHT", str(title)[:80], "Инсайт успешно записан в таблицу meta_insights")
+
+    return {
+        "status": "ok",
+        "message": "Insight successfully saved to database",
+        "id": new_insight.id,
+        "title": new_insight.title
+    }
+
+
+@app.post("/api/memory/trends", tags=["Hermes Read/Write API"])
+@app.post("/api/hermes/trends", tags=["Hermes Read/Write API"])
+async def hermes_write_trend(
+    request: Request,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """Разрешает прямую POST-запись нового тренда в таблицу trend_memory"""
+    title = str(payload.get("title") or payload.get("name") or "Тренд от Гермеса")[:150]
+    essence = str(payload.get("core_essence") or payload.get("essence") or payload.get("summary") or payload.get("text") or title)
+    keywords = payload.get("keywords_multilang") or payload.get("keywords") or payload.get("tags") or []
+    if isinstance(keywords, str):
+        keywords = [k.strip() for k in keywords.split(",") if k.strip()]
+
+    count_all = len((await db.execute(select(TrendMemory.id))).scalars().all())
+    vec = TrendMathEngine.compute_multilang_vector(f"{title} {' '.join(keywords)}")
+    now_iso = utcnow().isoformat()
+
+    new_tr = TrendMemory(
+        code=f"HIVE-{count_all + 1:04d}",
+        title=title,
+        core_essence=essence,
+        keywords_multilang=keywords if isinstance(keywords, list) else [],
+        embedding=vec,
+        origin_geo=str(payload.get("origin_geo", "GLOBAL")),
+        geo_spread=payload.get("geo_spread", ["GLOBAL"]),
+        lifecycle_status=str(payload.get("lifecycle_status", "ACCELERATING")),
+        acceleration_rate=float(payload.get("acceleration_rate", 1.0)),
+        delta_history=[{"timestamp": now_iso, "date": utcnow().strftime("%Y-%m-%d %H:%M"), "source": "Hermes", "author": "Hermes", "event": essence[:240]}]
+    )
+    db.add(new_tr)
+    await db.commit()
+    await db.refresh(new_tr)
+
+    client_ip = request.client.host if request.client else "Hermes"
+    await log_user_action(db, f"Hermes ({client_ip})", "HERMES_WRITE_TREND", new_tr.code, f"Записан тренд: {title[:60]}")
+    return {"status": "ok", "code": new_tr.code, "title": new_tr.title}
+
+
+@app.get("/api/hermes/digest", tags=["Hermes Read/Write API"])
+@app.get("/api/digest", tags=["Hermes Read/Write API"])
 async def hermes_get_digest(request: Request, limit: int = 10, only_accelerating: bool = False, db: AsyncSession = Depends(get_db)):
     stmt = select(TrendMemory).where(TrendMemory.lifecycle_status != "IGNORED_NOISE")
     if only_accelerating:
@@ -91,8 +203,8 @@ async def hermes_get_digest(request: Request, limit: int = 10, only_accelerating
     }
 
 
-@app.get("/api/hermes/search", tags=["Hermes API"])
-@app.get("/api/search", tags=["Hermes API"])
+@app.get("/api/hermes/search", tags=["Hermes Read/Write API"])
+@app.get("/api/search", tags=["Hermes Read/Write API"])
 async def hermes_semantic_rag_search(request: Request, q: str, limit: int = 7, db: AsyncSession = Depends(get_db)):
     q_vec = TrendMathEngine.compute_multilang_vector(q)
     dist_col = TrendMemory.embedding.cosine_distance(q_vec).label("dist")
@@ -112,7 +224,7 @@ async def hermes_semantic_rag_search(request: Request, q: str, limit: int = 7, d
         "title": r[0].title,
         "essence": r[0].core_essence,
         "keywords": r[0].keywords_multilang,
-        "acceleration_rate": r.acceleration_rate if hasattr(r, "acceleration_rate") else r[0].acceleration_rate,
+        "acceleration_rate": r[0].acceleration_rate,
         "z_score": r[0].z_score,
         "delta_history": (r[0].delta_history or [])[-3:]
     } for r in rows]
@@ -124,80 +236,8 @@ async def hermes_semantic_rag_search(request: Request, q: str, limit: int = 7, d
     }
 
 
-@app.post("/api/hermes/ingest-insight", tags=["Hermes API"])
-@app.post("/api/ingest-insight", tags=["Hermes API"])
-@app.post("/api/hermes/ingest", tags=["Hermes API"])
-@app.post("/api/ingest", tags=["Hermes API"])
-@app.post("/api/hermes/insights", tags=["Hermes API"])
-@app.post("/api/insights", tags=["Hermes API"])
-async def hermes_universal_ingest(
-    request: Request,
-    payload: dict = Body(...),
-    db: AsyncSession = Depends(get_db)
-):
-    """Принимает POST JSON с инсайтом от Гермеса по любому из ожидаемых путей и сохраняет в БД"""
-    title = (
-        payload.get("title")
-        or payload.get("name")
-        or payload.get("topic")
-        or payload.get("heading")
-        or "Инсайт от агента Гермес"
-    )
-    summary = (
-        payload.get("consumer_pain_summary")
-        or payload.get("summary")
-        or payload.get("description")
-        or payload.get("essence")
-        or payload.get("content")
-        or payload.get("text")
-        or str(payload)
-    )
-    thesis = (
-        payload.get("investment_or_product_thesis")
-        or payload.get("investment_thesis")
-        or payload.get("thesis")
-        or payload.get("insight")
-        or payload.get("recommendation")
-        or payload.get("conclusion")
-        or "Структурированный вывод получен от внешнего агента Гермес."
-    )
-    codes = (
-        payload.get("linked_trend_codes")
-        or payload.get("linked_codes")
-        or payload.get("trends")
-        or payload.get("codes")
-        or []
-    )
-    if isinstance(codes, str):
-        codes = [c.strip() for c in codes.split(",") if c.strip()]
-
-    score = float(payload.get("confidence_score") or payload.get("confidence") or payload.get("score") or 0.9)
-
-    new_insight = MetaInsight(
-        title=str(title)[:200],
-        linked_trend_codes=codes if isinstance(codes, list) else [],
-        pattern_type=str(payload.get("pattern_type", "HERMES_INGEST")),
-        consumer_pain_summary=str(summary),
-        investment_or_product_thesis=str(thesis),
-        confidence_score=score
-    )
-    db.add(new_insight)
-    await db.commit()
-    await db.refresh(new_insight)
-
-    client_ip = request.client.host if request.client else "Hermes"
-    await log_user_action(db, f"Hermes ({client_ip})", "HERMES_INGEST", str(title)[:80], "Инсайт от Гермеса сохранен в БД")
-
-    return {
-        "status": "ok",
-        "message": "Insight successfully ingested into Trend Swarm DB",
-        "id": new_insight.id,
-        "title": new_insight.title
-    }
-
-
 # =====================================================================
-# 2. ЭНДПОИНТЫ ПАНЕЛИ УПРАВЛЕНИЯ
+# 2. ЭНДПОИНТЫ ЧТЕНИЯ И УПРАВЛЕНИЯ УЛЬЕМ
 # =====================================================================
 @app.get("/api/swarm/status")
 async def get_swarm_status(db: AsyncSession = Depends(get_db)):
@@ -223,7 +263,7 @@ async def scale_swarm_scouts(request: Request, scout_count: int, db: AsyncSessio
     return {"status": "scaled", "scout_count": swarm_controller.scout_count}
 
 
-@app.get("/api/memory/trends")
+@app.get("/api/memory/trends", tags=["Hermes Read/Write API"])
 async def get_trends(db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(TrendMemory).where(TrendMemory.lifecycle_status != "IGNORED_NOISE").order_by(TrendMemory.acceleration_rate.desc(), TrendMemory.last_updated_at.desc()))).scalars().all()
     return [{
@@ -245,9 +285,9 @@ async def clear_memory_comb(request: Request, db: AsyncSession = Depends(get_db)
     return {"status": "cleared"}
 
 
-@app.get("/api/memory/meta-insights")
-@app.get("/api/hermes/insights", tags=["Hermes API"])
-@app.get("/api/insights", tags=["Hermes API"])
+@app.get("/api/memory/meta-insights", tags=["Hermes Read/Write API"])
+@app.get("/api/hermes/insights", tags=["Hermes Read/Write API"])
+@app.get("/api/insights", tags=["Hermes Read/Write API"])
 async def get_meta_insights(db: AsyncSession = Depends(get_db)):
     return (await db.execute(select(MetaInsight).order_by(MetaInsight.created_at.desc()))).scalars().all()
 
@@ -376,8 +416,9 @@ async def admin_dashboard():
         <div class="card" style="border-left-color:#3b82f6; margin-bottom:16px;">
             <b>🔗 POST/GET API для агента Гермес активен на порту :8000:</b><br>
             <small style="color:#94a3b8;">
-                &bull; Запись инсайта от Гермеса (POST JSON): <code>POST /api/hermes/ingest-insight</code> (или <code>/api/ingest</code>, <code>/api/insights</code>)<br>
-                &bull; Забрать дайджест: <code>GET /api/hermes/digest?limit=10</code> | Поиск: <code>GET /api/hermes/search?q=запрос</code>
+                &bull; Запись инсайта (POST JSON): <code>POST /api/memory/meta-insights</code> (или <code>/api/hermes/ingest-insight</code>, <code>/api/ingest</code>)<br>
+                &bull; Запись тренда (POST JSON): <code>POST /api/memory/trends</code><br>
+                &bull; Чтение дайджеста: <code>GET /api/hermes/digest?limit=10</code> | Поиск: <code>GET /api/hermes/search?q=запрос</code>
             </small>
         </div>
         <div id="meta-container"></div>
