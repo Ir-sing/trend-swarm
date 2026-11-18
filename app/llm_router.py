@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from litellm import acompletion
 from app.models import AgentRoleConfig, ConnectorCredential
 from app.math_engine import TrendMathEngine
+from app.connectors import ResourceConnectorEngine
 
 class DynamicModelRouter:
     @classmethod
@@ -16,7 +17,6 @@ class DynamicModelRouter:
         cred = (await db.execute(select(ConnectorCredential).where(ConnectorCredential.service_name == cfg.credential_service))).scalars().first()
         token_or_url = cred.api_key_or_token.strip() if (cred and cred.api_key_or_token) else ""
 
-        # Определяем параметры подключения (Локальная модель Ollama / vLLM без ключей ИЛИ внешний API, если указан)
         api_base = cfg.api_base or os.getenv("LOCAL_LLM_URL")
         api_key = None
 
@@ -29,7 +29,19 @@ class DynamicModelRouter:
             try:
                 messages = [{"role": "system", "content": cfg.system_prompt}]
                 if image_url:
-                    messages.append({"role": "user", "content": [{"type": "text", "text": user_payload}, {"type": "image_url", "image_url": {"url": image_url}}]})
+                    # Для локальных моделей (Ollama llava / qwen2.5-vl) переводим превью картинки/видео в base64!
+                    img_payload = image_url
+                    if cfg.provider in ("ollama", "vllm"):
+                        b64_img = await ResourceConnectorEngine.fetch_image_as_base64(image_url)
+                        if b64_img:
+                            img_payload = b64_img
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_payload},
+                            {"type": "image_url", "image_url": {"url": img_payload}}
+                        ]
+                    })
                 else:
                     messages.append({"role": "user", "content": user_payload})
 
@@ -53,12 +65,10 @@ class DynamicModelRouter:
 
                 resp = await acompletion(**kwargs)
                 return json.loads(resp.choices[0].message.content)
-            except Exception as e:
-                # Если локальный сервер Ollama еще не поднят — не падаем и не лепим фейковые обертки,
-                # а передаем управление чистому математическому экстрактору фактов:
+            except Exception:
                 pass
 
-        # Чистая математическая выжимка факта (без фальшивых фраз "Сигнал [...]", "Сдвиг спроса..." и без обрывков!)
+        # Математический экстрактор (сохраняет найденные картинки, мемы и видео даже без запущенной VLM)
         if raw_items:
             extracted = TrendMathEngine.extract_clean_facts_and_terms(raw_items)
             if extracted.get("has_signal"):
