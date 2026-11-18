@@ -1,8 +1,8 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Body
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from sqlalchemy import select, text, delete, or_
+from sqlalchemy import select, text, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import engine, Base, AsyncSessionLocal, get_db
@@ -14,9 +14,11 @@ from app.seed import seed_initial_data
 from app.swarm_worker import swarm_controller
 from app.math_engine import TrendMathEngine
 
+
 async def log_user_action(db: AsyncSession, actor: str, action_type: str, target: str, details: str):
     db.add(UserAuditLog(actor=actor, action_type=action_type, target=target, details=details))
     await db.commit()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,17 +30,20 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE trend_memory ADD COLUMN IF NOT EXISTS z_score FLOAT DEFAULT 0.0"))
     async with AsyncSessionLocal() as db:
         await seed_initial_data(db)
-        await log_user_action(db, "SYSTEM", "SERVER_START", "Проект Улей", "Контейнер запущен, схема БД синхронизирована")
+        await log_user_action(db, "SYSTEM", "SERVER_START", "Проект Улей", "Сервер запущен, API приёма инсайтов Гермеса активен")
     await swarm_controller.start(scout_count=4)
     yield
     await swarm_controller.stop()
 
-app = FastAPI(title="Проект «Улей». Поиск трендов и RAG-шлюз Гермеса", lifespan=lifespan)
+
+app = FastAPI(title="Проект «Улей». Поиск трендов и API Гермеса", lifespan=lifespan)
+
 
 class CredentialUpdateSchema(BaseModel):
     service_name: str
     title: str
     api_key_or_token: str
+
 
 class RoleConfigSchema(BaseModel):
     role_name: str
@@ -49,19 +54,13 @@ class RoleConfigSchema(BaseModel):
     temperature: float = 0.2
     system_prompt: str
 
-class HermesIngestSchema(BaseModel):
-    title: str
-    linked_trend_codes: list[str] = []
-    consumer_pain_summary: str
-    investment_or_product_thesis: str
-    confidence_score: float = 0.9
 
 # =====================================================================
-# ШЛЮЗ ДЛЯ ВНЕШНЕГО АГЕНТА ГЕРМЕС (ТЕЛЕГРАМ- БОТ / СКИЛЛ НА ПОРТУ :8000)
+# 1. API ДЛЯ ГЕРМЕСА (ЧТЕНИЕ ДАЙДЖЕСТА, ПОИСК И POST-ЗАПИСЬ ИНСАЙТОВ В БАЗУ)
 # =====================================================================
-@app.get("/api/hermes/digest", tags=["Hermes Telegram Bridge"])
+@app.get("/api/hermes/digest", tags=["Hermes API"])
+@app.get("/api/digest", tags=["Hermes API"])
 async def hermes_get_digest(request: Request, limit: int = 10, only_accelerating: bool = False, db: AsyncSession = Depends(get_db)):
-    """Выгрузка структурированных трендов и зависимостей для слеш-команды Гермеса из Telegram"""
     stmt = select(TrendMemory).where(TrendMemory.lifecycle_status != "IGNORED_NOISE")
     if only_accelerating:
         stmt = stmt.where(TrendMemory.acceleration_rate > 0)
@@ -69,7 +68,8 @@ async def hermes_get_digest(request: Request, limit: int = 10, only_accelerating
     trends = (await db.execute(stmt)).scalars().all()
     metas = (await db.execute(select(MetaInsight).order_by(MetaInsight.created_at.desc()).limit(limit))).scalars().all()
 
-    await log_user_action(db, f"Hermes-Bot ({request.client.host})", "HERMES_DIGEST_PULL", f"limit={limit}", f"Выгружено {len(trends)} трендов и {len(metas)} зависимостей")
+    client_ip = request.client.host if request.client else "Hermes"
+    await log_user_action(db, f"Hermes ({client_ip})", "HERMES_DIGEST_PULL", f"limit={limit}", f"Отдано {len(trends)} трендов и {len(metas)} инсайтов")
 
     rag_lines = [f"[{t.code}] (Ускорение: {t.acceleration_rate}x, Z={t.z_score}σ, Гео={t.geo_spread}): {t.title} — {t.core_essence}" for t in trends]
     return {
@@ -85,14 +85,15 @@ async def hermes_get_digest(request: Request, limit: int = 10, only_accelerating
             "latest_events": (t.delta_history or [])[-3:]
         } for t in trends],
         "cross_dependencies": [{
-            "title": m.title, "linked_trends": m.linked_trend_codes,
+            "id": m.id, "title": m.title, "linked_trends": m.linked_trend_codes,
             "summary": m.consumer_pain_summary, "investment_thesis": m.investment_or_product_thesis
         } for m in metas]
     }
 
-@app.get("/api/hermes/search", tags=["Hermes Telegram Bridge"])
+
+@app.get("/api/hermes/search", tags=["Hermes API"])
+@app.get("/api/search", tags=["Hermes API"])
 async def hermes_semantic_rag_search(request: Request, q: str, limit: int = 7, db: AsyncSession = Depends(get_db)):
-    """Векторный (pgvector) + ключевой RAG-поиск по Сотам Памяти по контекстному запросу из Telegram"""
     q_vec = TrendMathEngine.compute_multilang_vector(q)
     dist_col = TrendMemory.embedding.cosine_distance(q_vec).label("dist")
     stmt = (
@@ -102,7 +103,8 @@ async def hermes_semantic_rag_search(request: Request, q: str, limit: int = 7, d
         .limit(limit)
     )
     rows = (await db.execute(stmt)).all()
-    await log_user_action(db, f"Hermes-Bot ({request.client.host})", "HERMES_RAG_SEARCH", f"q='{q}'", f"Найдено {len(rows)} семантических совпадений в pgvector")
+    client_ip = request.client.host if request.client else "Hermes"
+    await log_user_action(db, f"Hermes ({client_ip})", "HERMES_RAG_SEARCH", f"q='{q}'", f"Найдено {len(rows)} совпадений")
 
     results = [{
         "code": r[0].code,
@@ -110,7 +112,7 @@ async def hermes_semantic_rag_search(request: Request, q: str, limit: int = 7, d
         "title": r[0].title,
         "essence": r[0].core_essence,
         "keywords": r[0].keywords_multilang,
-        "acceleration_rate": r[0].acceleration_rate,
+        "acceleration_rate": r.acceleration_rate if hasattr(r, "acceleration_rate") else r[0].acceleration_rate,
         "z_score": r[0].z_score,
         "delta_history": (r[0].delta_history or [])[-3:]
     } for r in rows]
@@ -121,27 +123,87 @@ async def hermes_semantic_rag_search(request: Request, q: str, limit: int = 7, d
         "matches": results
     }
 
-@app.post("/api/hermes/ingest-insight", tags=["Hermes Telegram Bridge"])
-async def hermes_ingest_insight(request: Request, payload: HermesIngestSchema, db: AsyncSession = Depends(get_db)):
-    """Позволяет внешнему Гермесу сохранить свой структурированный вывод обратно во вкладку Зависимостей Улья"""
-    db.add(MetaInsight(
-        title=payload.title,
-        linked_trend_codes=payload.linked_trend_codes,
-        pattern_type="HERMES_SYNTHESIS",
-        consumer_pain_summary=payload.consumer_pain_summary,
-        investment_or_product_thesis=payload.investment_or_product_thesis,
-        confidence_score=payload.confidence_score
-    ))
-    await log_user_action(db, f"Hermes-Bot ({request.client.host})", "HERMES_INGEST", payload.title, "Внешний Гермес записал структурированный вывод в Улей")
-    return {"status": "saved_to_hive"}
+
+@app.post("/api/hermes/ingest-insight", tags=["Hermes API"])
+@app.post("/api/ingest-insight", tags=["Hermes API"])
+@app.post("/api/hermes/ingest", tags=["Hermes API"])
+@app.post("/api/ingest", tags=["Hermes API"])
+@app.post("/api/hermes/insights", tags=["Hermes API"])
+@app.post("/api/insights", tags=["Hermes API"])
+async def hermes_universal_ingest(
+    request: Request,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """Принимает POST JSON с инсайтом от Гермеса по любому из ожидаемых путей и сохраняет в БД"""
+    title = (
+        payload.get("title")
+        or payload.get("name")
+        or payload.get("topic")
+        or payload.get("heading")
+        or "Инсайт от агента Гермес"
+    )
+    summary = (
+        payload.get("consumer_pain_summary")
+        or payload.get("summary")
+        or payload.get("description")
+        or payload.get("essence")
+        or payload.get("content")
+        or payload.get("text")
+        or str(payload)
+    )
+    thesis = (
+        payload.get("investment_or_product_thesis")
+        or payload.get("investment_thesis")
+        or payload.get("thesis")
+        or payload.get("insight")
+        or payload.get("recommendation")
+        or payload.get("conclusion")
+        or "Структурированный вывод получен от внешнего агента Гермес."
+    )
+    codes = (
+        payload.get("linked_trend_codes")
+        or payload.get("linked_codes")
+        or payload.get("trends")
+        or payload.get("codes")
+        or []
+    )
+    if isinstance(codes, str):
+        codes = [c.strip() for c in codes.split(",") if c.strip()]
+
+    score = float(payload.get("confidence_score") or payload.get("confidence") or payload.get("score") or 0.9)
+
+    new_insight = MetaInsight(
+        title=str(title)[:200],
+        linked_trend_codes=codes if isinstance(codes, list) else [],
+        pattern_type=str(payload.get("pattern_type", "HERMES_INGEST")),
+        consumer_pain_summary=str(summary),
+        investment_or_product_thesis=str(thesis),
+        confidence_score=score
+    )
+    db.add(new_insight)
+    await db.commit()
+    await db.refresh(new_insight)
+
+    client_ip = request.client.host if request.client else "Hermes"
+    await log_user_action(db, f"Hermes ({client_ip})", "HERMES_INGEST", str(title)[:80], "Инсайт от Гермеса сохранен в БД")
+
+    return {
+        "status": "ok",
+        "message": "Insight successfully ingested into Trend Swarm DB",
+        "id": new_insight.id,
+        "title": new_insight.title
+    }
+
 
 # =====================================================================
-# ВНУТРЕННИЕ ЭНДПОИНТЫ ПАНЕЛИ УПРАВЛЕНИЯ С ЗАПИСЬЮ В AUDIT LOG
+# 2. ЭНДПОИНТЫ ПАНЕЛИ УПРАВЛЕНИЯ
 # =====================================================================
 @app.get("/api/swarm/status")
 async def get_swarm_status(db: AsyncSession = Depends(get_db)):
     agents = (await db.execute(select(AgentTelemetry).order_by(AgentTelemetry.agent_type, AgentTelemetry.agent_id))).scalars().all()
     return {"is_running": swarm_controller.is_running, "scout_count": swarm_controller.scout_count, "agents": agents}
+
 
 @app.post("/api/swarm/toggle")
 async def toggle_swarm(request: Request, run: bool, db: AsyncSession = Depends(get_db)):
@@ -149,15 +211,17 @@ async def toggle_swarm(request: Request, run: bool, db: AsyncSession = Depends(g
         await swarm_controller.start(scout_count=swarm_controller.scout_count)
     else:
         await swarm_controller.stop()
-    await log_user_action(db, request.client.host, "SWARM_TOGGLE", "Рой Улья", f"Переключен статус роя: {'ВЫЛЕТ (RUN)' if run else 'ПАУЗА (STOP)'}")
+    await log_user_action(db, request.client.host, "SWARM_TOGGLE", "Рой Улья", f"Статус роя: {'ВЫЛЕТ' if run else 'ПАУЗА'}")
     return {"is_running": swarm_controller.is_running}
+
 
 @app.post("/api/swarm/scale")
 async def scale_swarm_scouts(request: Request, scout_count: int, db: AsyncSession = Depends(get_db)):
     old_c = swarm_controller.scout_count
     await swarm_controller.scale_scouts(scout_count)
-    await log_user_action(db, request.client.host, "SWARM_SCALE", "Штат Пчёл-Разведчиц", f"Изменено количество разведчиц: {old_c} -> {swarm_controller.scout_count}")
+    await log_user_action(db, request.client.host, "SWARM_SCALE", "Штат Пчёл", f"Разведчиц: {old_c} -> {swarm_controller.scout_count}")
     return {"status": "scaled", "scout_count": swarm_controller.scout_count}
+
 
 @app.get("/api/memory/trends")
 async def get_trends(db: AsyncSession = Depends(get_db)):
@@ -171,17 +235,22 @@ async def get_trends(db: AsyncSession = Depends(get_db)):
         "is_in_mainstream_media": r.is_in_mainstream_media, "delta_history": r.delta_history
     } for r in rows]
 
+
 @app.post("/api/memory/clear")
 async def clear_memory_comb(request: Request, db: AsyncSession = Depends(get_db)):
     await db.execute(delete(TrendMemory))
     await db.execute(delete(MetaInsight))
     await db.execute(delete(SwarmBlackboard))
-    await log_user_action(db, request.client.host, "MEMORY_CLEAR", "Соты Памяти", "Полная очистка накопленных трендов и зависимостей пользователем")
+    await log_user_action(db, request.client.host, "MEMORY_CLEAR", "Соты Памяти", "Очистка накопленных трендов и инсайтов")
     return {"status": "cleared"}
 
+
 @app.get("/api/memory/meta-insights")
+@app.get("/api/hermes/insights", tags=["Hermes API"])
+@app.get("/api/insights", tags=["Hermes API"])
 async def get_meta_insights(db: AsyncSession = Depends(get_db)):
     return (await db.execute(select(MetaInsight).order_by(MetaInsight.created_at.desc()))).scalars().all()
+
 
 @app.patch("/api/memory/trends/{code}")
 async def change_trend_status(request: Request, code: str, status: str, db: AsyncSession = Depends(get_db)):
@@ -189,8 +258,9 @@ async def change_trend_status(request: Request, code: str, status: str, db: Asyn
     if not tr:
         raise HTTPException(404)
     tr.lifecycle_status = status
-    await log_user_action(db, request.client.host, "TREND_STATUS_CHANGE", code, f"Тренд '{tr.title[:50]}' переведен в статус {status}")
+    await log_user_action(db, request.client.host, "TREND_STATUS_CHANGE", code, f"Статус изменен на {status}")
     return {"status": "ok"}
+
 
 @app.get("/api/resources")
 async def get_all_resources(db: AsyncSession = Depends(get_db)):
@@ -199,11 +269,11 @@ async def get_all_resources(db: AsyncSession = Depends(get_db)):
     masked_creds = []
     for c in creds:
         val = c.api_key_or_token or ""
-        # URL локальной модели оставляем видимым, а секретные токены маскируем
         if val and not val.startswith("http"):
             val = "***" + val[-4:] if len(val) > 4 else "***"
         masked_creds.append({"service_name": c.service_name, "title": c.title, "api_key_or_token": val})
     return {"resources": resources, "credentials": masked_creds}
+
 
 @app.patch("/api/resources/{res_id}/toggle")
 async def toggle_resource(request: Request, res_id: int, db: AsyncSession = Depends(get_db)):
@@ -213,6 +283,7 @@ async def toggle_resource(request: Request, res_id: int, db: AsyncSession = Depe
         await log_user_action(db, request.client.host, "RESOURCE_TOGGLE", r.name, f"Ресурс {'включен' if r.is_active else 'выключен'}")
     return {"status": "ok"}
 
+
 @app.post("/api/credentials")
 async def save_credential(request: Request, payload: CredentialUpdateSchema, db: AsyncSession = Depends(get_db)):
     if payload.api_key_or_token.startswith("***"):
@@ -220,12 +291,16 @@ async def save_credential(request: Request, payload: CredentialUpdateSchema, db:
     c = (await db.execute(select(ConnectorCredential).where(ConnectorCredential.service_name == payload.service_name))).scalars().first()
     if c:
         c.api_key_or_token = payload.api_key_or_token
-    await log_user_action(db, request.client.host, "CREDENTIAL_UPDATE", payload.service_name, f"Обновлены параметры доступа для {payload.title}")
+    else:
+        db.add(ConnectorCredential(**payload.model_dump()))
+    await log_user_action(db, request.client.host, "CREDENTIAL_UPDATE", payload.service_name, f"Обновлен доступ: {payload.title}")
     return {"status": "saved"}
+
 
 @app.get("/api/models")
 async def get_models(db: AsyncSession = Depends(get_db)):
     return (await db.execute(select(AgentRoleConfig))).scalars().all()
+
 
 @app.post("/api/models")
 async def save_model(request: Request, payload: RoleConfigSchema, db: AsyncSession = Depends(get_db)):
@@ -233,12 +308,14 @@ async def save_model(request: Request, payload: RoleConfigSchema, db: AsyncSessi
     if m:
         for k, v in payload.model_dump().items():
             setattr(m, k, v)
-        await log_user_action(db, request.client.host, "MODEL_PROMPT_UPDATE", payload.role_name, f"Обновлена модель ({payload.provider}/{payload.model_name}) или промпт роли")
+        await log_user_action(db, request.client.host, "MODEL_PROMPT_UPDATE", payload.role_name, f"Обновлена модель/промпт ({payload.provider}/{payload.model_name})")
     return {"status": "saved"}
+
 
 @app.get("/api/audit-logs")
 async def get_audit_logs(db: AsyncSession = Depends(get_db)):
     return (await db.execute(select(UserAuditLog).order_by(UserAuditLog.created_at.desc()).limit(150))).scalars().all()
+
 
 @app.get("/", response_class=HTMLResponse)
 async def admin_dashboard():
@@ -281,7 +358,7 @@ async def admin_dashboard():
 
     <div class="tabs">
         <div class="tab active" onclick="showTab('tab-agents', this)">1. Жизнь Улья (Королева + Разведчицы + Фуражиры + Приёмщицы + Стражи)</div>
-        <div class="tab" onclick="showTab('tab-meta', this)">2. Выявленные Зависимости & RAG-мост Гермеса</div>
+        <div class="tab" onclick="showTab('tab-meta', this)">2. Выявленные Зависимости & Инсайты Гермеса</div>
         <div class="tab" onclick="showTab('tab-memory', this)">3. Соты Памяти (Базовый замер vs Ускорение)</div>
         <div class="tab" onclick="showTab('tab-resources', this)">4. Поле 120 URL & Локальная модель</div>
         <div class="tab" onclick="showTab('tab-models', this)">5. Роли и Промпты</div>
@@ -297,11 +374,10 @@ async def admin_dashboard():
 
     <div id="tab-meta" class="tab-content" style="display:none;">
         <div class="card" style="border-left-color:#3b82f6; margin-bottom:16px;">
-            <b>🔗 Внешний RAG-шлюз для навыка Гермеса (Telegram) активен на порту :8000:</b><br>
+            <b>🔗 POST/GET API для агента Гермес активен на порту :8000:</b><br>
             <small style="color:#94a3b8;">
-                &bull; Полный дайджест по слеш-команде: <code>GET /api/hermes/digest?limit=10&only_accelerating=false</code><br>
-                &bull; Контекстный векторный поиск (pgvector): <code>GET /api/hermes/search?q=ваш_запрос&limit=7</code><br>
-                &bull; Запись вывода от Гермеса обратно в Улей: <code>POST /api/hermes/ingest-insight</code>
+                &bull; Запись инсайта от Гермеса (POST JSON): <code>POST /api/hermes/ingest-insight</code> (или <code>/api/ingest</code>, <code>/api/insights</code>)<br>
+                &bull; Забрать дайджест: <code>GET /api/hermes/digest?limit=10</code> | Поиск: <code>GET /api/hermes/search?q=запрос</code>
             </small>
         </div>
         <div id="meta-container"></div>
@@ -309,7 +385,7 @@ async def admin_dashboard():
 
     <div id="tab-memory" class="tab-content" style="display:none;">
         <div style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
-            <span><b>Математика Пчёл-Приёмщиц:</b> 1-е упоминание = <code>ЗАМЕР БАЗЫ (0.0x)</code>. Ускорение растет только при превышении базовой частоты в новых окнах.</span>
+            <span><b>Математика Пчёл-Приёмщиц:</b> 1-е упоминание = <code>ЗАМЕР БАЗЫ (0.0x)</code>. Ускорение растет при превышении базовой частоты.</span>
             <button class="btn btn-red" onclick="clearMemory()">🧹 Очистить соты памяти</button>
         </div>
         <div id="trends-container"></div>
@@ -327,7 +403,7 @@ async def admin_dashboard():
     <div id="tab-models" class="tab-content" style="display:none;"><div id="models-container"></div></div>
 
     <div id="tab-logs" class="tab-content" style="display:none;">
-        <h3>📋 Журнал действий пользователей и внешних запросов Гермеса (Audit Log):</h3>
+        <h3>📋 Журнал действий пользователей и запросов Гермеса (Audit Log):</h3>
         <table>
             <thead><tr><th>Время (UTC)</th><th>Субъект (IP / Бот)</th><th>Тип события</th><th>Объект</th><th>Детали операции</th></tr></thead>
             <tbody id="logs-tbody"></tbody>
@@ -372,11 +448,11 @@ async def admin_dashboard():
         const items = await (await fetch('/api/memory/meta-insights')).json();
         document.getElementById('meta-container').innerHTML = items.length ? items.map(m => `
             <div class="card" style="border-left-color:#10b981;">
-                <b>💡 ${m.title}</b> <span class="badge">Связанные соты: ${(m.linked_trend_codes || []).join(', ')}</span>
-                <p style="white-space:pre-line;"><b>Пересечение сигналов:</b>\n${m.consumer_pain_summary}</p>
-                <p style="color:#34d399;"><b>Вывод / Направление:</b> ${m.investment_or_product_thesis}</p>
+                <b>💡 ${m.title}</b> <span class="badge">${m.pattern_type}</span> <span class="badge">Связанные соты: ${(m.linked_trend_codes || []).join(', ')}</span>
+                <p style="white-space:pre-line;"><b>Суть / Контекст:</b>\n${m.consumer_pain_summary}</p>
+                <p style="color:#34d399;"><b>Инвестиционный / продуктовый вывод:</b> ${m.investment_or_product_thesis}</p>
             </div>
-        `).join('') : '<p>Пчела-Приёмщица выводит новые кросс-зависимости по мере накопления пересекающихся сигналов...</p>';
+        `).join('') : '<p>Ожидание записи инсайтов от Гермеса или Пчелы-Приёмщицы...</p>';
     }
     async function loadTrends() {
         const trends = await (await fetch('/api/memory/trends')).json();
@@ -421,7 +497,7 @@ async def admin_dashboard():
     async function saveCred(service_name, title) {
         const val = document.getElementById('cred-' + service_name).value;
         await fetch('/api/credentials', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({service_name, title, api_key_or_token: val})});
-        alert('Сохранено в БД и записано в Лог действий!');
+        alert('Сохранено!');
     }
     async function toggleRes(id) { await fetch(`/api/resources/${id}/toggle`, {method:'PATCH'}); loadResources(); }
     async function loadModels() {
