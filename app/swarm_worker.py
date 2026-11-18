@@ -90,9 +90,8 @@ class ScoutAndForagerBee:
 
     async def forage_by_waggle_dance(self, db: AsyncSession) -> bool:
         """
-        Режим Рабочей пчелы (Фуражира):
-        Проверяет ключевые корни сигнала сразу по ВСЕМ закешированным сайтам целевого блока
-        (investments, b2b_patents, mainstream_media) за 0 байт трафика и 0 токенов!
+        Атомарно захватывает задание на Доске, СНАЧАЛА фиксирует шаг проверки в БД (чтобы не потерять лок),
+        и проверяет ключи сразу по всем закешированным сайтам целевого блока за 0 байт трафика.
         """
         stmt = (
             select(SwarmBlackboard)
@@ -112,6 +111,14 @@ class ScoutAndForagerBee:
             return True
 
         target_block = unchecked[0]
+        # Сначала фиксируем захват блока в рамках текущей транзакции FOR UPDATE!
+        checked = list(signal.checked_by_blocks or [])
+        checked.append(target_block)
+        signal.checked_by_blocks = checked
+        if len(checked) >= len(signal.target_block_types or []):
+            signal.status = "PROMOTED_TO_MEMORY"
+        await db.commit()
+
         block_resources = (
             await db.execute(
                 select(Resource).join(SemanticBlock).where(
@@ -127,21 +134,9 @@ class ScoutAndForagerBee:
         )
 
         hits = ResourceConnectorEngine.search_block_cache(block_resources, signal.search_queries)
-        checked = list(signal.checked_by_blocks or [])
-        checked.append(target_block)
-        signal.checked_by_blocks = checked
-
         for matched_res, matched_items in hits[:3]:
             sample_text = " . ".join([i["text"][:200] for i in matched_items[:2]])
             authors = list({i.get("author_id", matched_res.name) for i in matched_items[:2]})
-            conf = list(signal.confirmations or [])
-            conf.append({
-                "block": target_block,
-                "resource": matched_res.name,
-                "geo": matched_res.geo_region,
-                "details": sample_text[:180]
-            })
-            signal.confirmations = conf
             await self.hand_over_to_receiver_bee(
                 db, signal, matched_res.geo_region,
                 source_override=matched_res.name,
@@ -149,14 +144,9 @@ class ScoutAndForagerBee:
                 authors=authors,
                 is_mainstream=(target_block == "mainstream_media")
             )
-
-        if len(signal.checked_by_blocks) >= len(signal.target_block_types):
-            signal.status = "PROMOTED_TO_MEMORY"
-        await db.commit()
         return True
 
     async def scout_flowers(self, db: AsyncSession):
-        """Режим Пчелы-Разведчицы: равномерный облет всех 120 URL. Мейнстрим-СМИ используются строго как Kill-Switch!"""
         now = utcnow()
         stmt = (
             select(Resource, SemanticBlock.block_type)
@@ -204,9 +194,6 @@ class ScoutAndForagerBee:
                 )
                 return
 
-            # ВАЖНО: Если это Блок №6 (Мейнстрим-СМИ: РБК, Ведомости, Forbes, ТАСС, Lenta) —
-            # мы НЕ ищем в газетах новые тренды и НЕ тратим на них токены LLM!
-            # Мы только проверяем, не попали ли уже найденные нами тренды в заголовки этих газет (Kill-Switch)!
             if block_type == "mainstream_media":
                 media_blob = " ".join([i["text"].lower() for i in items])
                 active_trends = (
@@ -214,7 +201,7 @@ class ScoutAndForagerBee:
                 ).scalars().all()
                 flagged = 0
                 for tr in active_trends:
-                    stems = [k.lower()[:6] for k in (tr.keywords_multilang or []) if len(k) >= 4]
+                    stems = [k.lower()[:5] for k in (tr.keywords_multilang or []) if len(k) >= 4]
                     if len(stems) >= 2 and sum(1 for s in stems if s in media_blob) >= 2:
                         tr.is_in_mainstream_media = True
                         tr.lifecycle_status = "MAINSTREAM_PRICED_IN"
@@ -295,10 +282,10 @@ class ScoutAndForagerBee:
         existing = row[0] if (row and row[1] is not None and row[1] < 0.35) else None
 
         if not existing and signal.search_queries:
-            sig_stems = {k.lower()[:6] for k in signal.search_queries if len(k) >= 4}
+            sig_stems = {k.lower()[:5] for k in signal.search_queries if len(k) >= 4}
             recent_trends = (await db.execute(select(TrendMemory).order_by(TrendMemory.id.desc()).limit(80))).scalars().all()
             for tr in recent_trends:
-                tr_stems = {k.lower()[:6] for k in (tr.keywords_multilang or []) if len(k) >= 4}
+                tr_stems = {k.lower()[:5] for k in (tr.keywords_multilang or []) if len(k) >= 4}
                 if len(sig_stems.intersection(tr_stems)) >= 2:
                     existing = tr
                     break
@@ -310,10 +297,9 @@ class ScoutAndForagerBee:
         clean_title = (analysis or {}).get("title") or signal.signal_summary[:90]
         raw_essence = (analysis or {}).get("core_essence") or signal.signal_summary
 
-        # Подтягиваем предыдущие наблюдения этого же корня из матрицы кандидатов, если они были на других сайтах
         initial_deltas = []
         if not existing and signal.search_queries:
-            lead_st = signal.search_queries[0].lower()[:6]
+            lead_st = signal.search_queries[0].lower()[:5]
             prior_sightings = TrendMathEngine._candidate_sightings.get(lead_st, [])
             for ps in prior_sightings[-4:]:
                 if ps["source"] != src_name:
@@ -498,13 +484,13 @@ class ReceiverMathBeeAgent:
                     recent_trends = sorted(trends, key=lambda x: (x.acceleration_rate, x.id), reverse=True)[:60]
                     for i in range(len(recent_trends)):
                         t1 = recent_trends[i]
-                        kw1 = {k for k in (t1.keywords_multilang or []) if not TrendMathEngine.is_noise_stem(k[:6])}
+                        kw1 = {k for k in (t1.keywords_multilang or []) if not TrendMathEngine.is_noise_stem(k[:5])}
                         for j in range(i + 1, len(recent_trends)):
                             t2 = recent_trends[j]
                             pair_key = tuple(sorted([t1.code, t2.code]))
                             if pair_key in already_paired:
                                 continue
-                            kw2 = {k for k in (t2.keywords_multilang or []) if not TrendMathEngine.is_noise_stem(k[:6])}
+                            kw2 = {k for k in (t2.keywords_multilang or []) if not TrendMathEngine.is_noise_stem(k[:5])}
                             common_kw = kw1.intersection(kw2)
                             src1 = t1.delta_history[0].get("source", t1.origin_geo) if t1.delta_history else t1.origin_geo
                             src2 = t2.delta_history[0].get("source", t2.origin_geo) if t2.delta_history else t2.origin_geo
@@ -512,16 +498,19 @@ class ReceiverMathBeeAgent:
                             if common_kw and src1 != src2:
                                 already_paired.add(pair_key)
                                 shared_str = ", ".join(list(common_kw)[:3])
+                                pair_prompt = f"Тренд 1 ({src1}): {t1.title}. Тренд 2 ({src2}): {t2.title}. Общий маркер: {shared_str}"
+                                llm_meta = await DynamicModelRouter.ask_agent(db, "memory_analyst", pair_prompt)
+
                                 db.add(MetaInsight(
-                                    title=f"Межсайтовая зависимость по объекту [{shared_str}] ({t1.code} + {t2.code})",
+                                    title=llm_meta.get("title") or f"Межсайтовая зависимость по объекту [{shared_str}] ({t1.code} + {t2.code})",
                                     linked_trend_codes=list(pair_key),
                                     pattern_type="CROSS_CHANNEL_RAG",
-                                    consumer_pain_summary=f"1) [{src1}]: {t1.title}\n2) [{src2}]: {t2.title}",
-                                    investment_or_product_thesis=(
+                                    consumer_pain_summary=llm_meta.get("consumer_pain_summary") or f"1) [{src1}]: {t1.title}\n2) [{src2}]: {t2.title}",
+                                    investment_or_product_thesis=llm_meta.get("investment_or_product_thesis") or (
                                         f"Специфический маркер [{shared_str}] независимо проявился в разных источниках ({src1} и {src2}). "
                                         f"Доступен для глубокого опроса через RAG-шлюз Гермеса: /api/hermes/search?q={list(common_kw)[0]}"
                                     ),
-                                    confidence_score=0.86
+                                    confidence_score=float(llm_meta.get("confidence_score", 0.86))
                                 ))
                                 new_pairs_found += 1
                                 if new_pairs_found >= 2:
@@ -560,7 +549,11 @@ class SwarmController:
         async with AsyncSessionLocal() as db:
             for r in (await db.execute(select(Resource))).scalars().all():
                 r.locked_by_agent = None
+            # Прогреваем матрицу IDF из уже накопленной базы трендов при старте
+            existing_titles = (await db.execute(select(TrendMemory.core_essence))).scalars().all()
+            TrendMathEngine.warmup_from_db(list(existing_titles))
             await db.commit()
+
         for i in range(1, self.scout_count + 1):
             aid = f"Пчела-Разведчица #{i}"
             self.scout_tasks[aid] = asyncio.create_task(ScoutAndForagerBee(aid, self).run_forever())
