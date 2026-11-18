@@ -18,7 +18,6 @@ def utcnow() -> datetime:
 
 
 def get_multi_site_note(delta_history: list[dict]) -> str:
-    """Добавляет сводку кросс-сайтовой встречаемости только тогда, когда явление замечено на >= 2 разных ресурсах"""
     now = utcnow()
     mentions_24h = 0
     sites_24h = []
@@ -65,6 +64,9 @@ async def update_agent_telemetry(
     await db.commit()
 
 
+# =====================================================================
+# 1. ПЧЕЛА-РАЗВЕДЧИЦА И РАБОЧАЯ ПЧЕЛА-ФУРАЖИР (SCOUT & FORAGER BEE)
+# =====================================================================
 class ScoutAndForagerBee:
     def __init__(self, agent_id: str, controller: "SwarmController"):
         self.agent_id = agent_id
@@ -90,79 +92,75 @@ class ScoutAndForagerBee:
             await update_agent_telemetry(db, self.agent_id, "РАЗВЕДЧИЦА / ФУРАЖИР", "STOPPED", "-", "В улье (На паузе)")
 
     async def forage_by_waggle_dance(self, db: AsyncSession) -> bool:
-        """Режим Рабочей пчелы (Фуражира): проверка найденного явления на инвест-площадках, в патентах и в СМИ"""
-        stmt = select(SwarmBlackboard).where(SwarmBlackboard.status == "ACTIVE").order_by(SwarmBlackboard.priority_boost.desc())
-        signals = (await db.execute(stmt)).scalars().all()
+        """
+        Режим Рабочей пчелы (Фуражира):
+        Проверяет ключевые корни сигнала сразу по ВСЕМ закешированным сайтам целевого блока
+        (investments, b2b_patents, mainstream_media) за 0 байт сетевого трафика.
+        Никаких случайных подстановок: подтверждение засчитывается строго при реальном совпадении!
+        """
+        stmt = (
+            select(SwarmBlackboard)
+            .where(SwarmBlackboard.status == "ACTIVE")
+            .order_by(SwarmBlackboard.priority_boost.desc())
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        signal = (await db.execute(stmt)).scalars().first()
+        if not signal:
+            return False
 
-        for signal in signals:
-            unchecked = [b for b in signal.target_block_types if b not in signal.checked_by_blocks]
-            if not unchecked:
-                signal.status = "PROMOTED_TO_MEMORY"
-                await db.commit()
-                continue
-
-            target_block = unchecked[0]
-            res_stmt = (
-                select(Resource)
-                .join(SemanticBlock)
-                .where(
-                    SemanticBlock.block_type == target_block,
-                    Resource.is_active == True,
-                    Resource.locked_by_agent == None
-                )
-                .order_by(Resource.last_crawled_at.asc().nullsfirst(), Resource.temperature.desc())
-                .with_for_update(skip_locked=True)
-                .limit(1)
-            )
-            resource = (await db.execute(res_stmt)).scalars().first()
-            if not resource:
-                continue
-
-            resource.locked_by_agent = self.agent_id
-            resource.locked_at = utcnow()
+        unchecked = [b for b in (signal.target_block_types or []) if b not in (signal.checked_by_blocks or [])]
+        if not unchecked or not signal.search_queries:
+            signal.status = "PROMOTED_TO_MEMORY"
             await db.commit()
-
-            try:
-                q = signal.search_queries[0] if signal.search_queries else ""
-                await update_agent_telemetry(
-                    db, self.agent_id, "РАБОЧАЯ ПЧЕЛА (ФУРАЖИР)", "FORAGING", resource.name,
-                    f"Проверка танца разведчицы по ключу [{q}] в блоке [{target_block}]"
-                )
-                items = await ResourceConnectorEngine.fetch(db, resource, search_query=q)
-                checked = list(signal.checked_by_blocks)
-                checked.append(target_block)
-                signal.checked_by_blocks = checked
-
-                if items:
-                    sample_text = " . ".join([i["text"][:200] for i in items[:3]])
-                    authors = list({i.get("author_id", resource.name) for i in items[:3]})
-                    analysis = await DynamicModelRouter.ask_agent(db, "dirty_scout", sample_text, raw_items=items[:3])
-                    if analysis.get("confirmed", False):
-                        conf = list(signal.confirmations)
-                        conf.append({
-                            "block": target_block,
-                            "resource": resource.name,
-                            "geo": resource.geo_region,
-                            "details": analysis.get("summary", sample_text[:160])
-                        })
-                        signal.confirmations = conf
-                        await self.hand_over_to_receiver_bee(
-                            db, signal, resource.geo_region,
-                            analysis=analysis, authors=authors,
-                            is_mainstream=(target_block == "mainstream_media")
-                        )
-            except Exception as err:
-                resource.fail_count = (resource.fail_count or 0) + 1
-                resource.last_error = str(err)[:200]
-                resource.health_status = "DEGRADED"
-            finally:
-                resource.locked_by_agent = None
-                await db.commit()
             return True
-        return False
+
+        target_block = unchecked[0]
+        block_resources = (
+            await db.execute(
+                select(Resource).join(SemanticBlock).where(
+                    SemanticBlock.block_type == target_block,
+                    Resource.is_active == True
+                )
+            )
+        ).scalars().all()
+
+        await update_agent_telemetry(
+            db, self.agent_id, "РАБОЧАЯ ПЧЕЛА (ФУРАЖИР)", "FORAGING", f"Блок [{target_block}] ({len(block_resources)} сайтов)",
+            f"Сверка ключей {signal.search_queries[:3]} сразу по всем сайтам блока [{target_block}]"
+        )
+
+        hits = ResourceConnectorEngine.search_block_cache(block_resources, signal.search_queries)
+        checked = list(signal.checked_by_blocks or [])
+        checked.append(target_block)
+        signal.checked_by_blocks = checked
+
+        for matched_res, matched_items in hits[:3]:
+            sample_text = " . ".join([i["text"][:200] for i in matched_items[:2]])
+            authors = list({i.get("author_id", matched_res.name) for i in matched_items[:2]})
+            conf = list(signal.confirmations or [])
+            conf.append({
+                "block": target_block,
+                "resource": matched_res.name,
+                "geo": matched_res.geo_region,
+                "details": sample_text[:180]
+            })
+            signal.confirmations = conf
+            await self.hand_over_to_receiver_bee(
+                db, signal, matched_res.geo_region,
+                source_override=matched_res.name,
+                event_override=sample_text[:240],
+                authors=authors,
+                is_mainstream=(target_block == "mainstream_media")
+            )
+
+        if len(signal.checked_by_blocks) >= len(signal.target_block_types):
+            signal.status = "PROMOTED_TO_MEMORY"
+        await db.commit()
+        return True
 
     async def scout_flowers(self, db: AsyncSession):
-        """Режим Пчелы-Разведчицы: равномерный облет всех 120 URL с защитой от сжигания трафика и токенов"""
+        """Режим Пчелы-Разведчицы: равномерный облет всех 120 URL от самых давно не проверенных к свежим"""
         now = utcnow()
         stmt = (
             select(Resource)
@@ -179,7 +177,7 @@ class ScoutAndForagerBee:
         if not resource:
             await update_agent_telemetry(
                 db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", "В улье",
-                "Все 120 ресурсов проверены, режим экономии трафика..."
+                "Все 120 ресурсов обследованы, режим бережной экономии трафика..."
             )
             await asyncio.sleep(15)
             return
@@ -198,7 +196,6 @@ class ScoutAndForagerBee:
             resource.last_crawled_at = utcnow()
             resource.fail_count = 0
             resource.health_status = "HEALTHY"
-            # После визита цветок остывает на -25°, чтобы пчелы летели к следующим по списку ресурсам
             resource.temperature = max(25.0, round(resource.temperature - 25.0, 1))
 
             if not items:
@@ -224,16 +221,16 @@ class ScoutAndForagerBee:
 
             await update_agent_telemetry(
                 db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "ANALYZING", resource.name,
-                f"Проверка {len(items)} записей через мат. фильтр и модель...", inc_items=len(items)
+                f"Проверка {len(items)} новых записей через мат. фильтр IDF и модель...", inc_items=len(items)
             )
-            analysis = await DynamicModelRouter.ask_agent(db, "dirty_scout", combined_text[:800], raw_items=items[:6])
+            analysis = await DynamicModelRouter.ask_agent(db, "dirty_scout", combined_text[:700], raw_items=items[:6])
 
-            if analysis.get("is_anomaly", False):
+            if analysis.get("is_anomaly", False) and analysis.get("multilang_keywords"):
                 resource.temperature = min(90.0, round(resource.temperature + 30.0, 1))
                 resource.cooldown_until = utcnow() + timedelta(minutes=25)
-                vec = DynamicModelRouter.compute_fast_vector(
-                    analysis.get("title", "") + " " + " ".join(analysis.get("multilang_keywords", []))
-                )
+                semantic_core = " ".join(analysis.get("multilang_keywords", [])) * 2 + " " + analysis.get("title", "")
+                vec = DynamicModelRouter.compute_fast_vector(semantic_core)
+
                 new_sig = SwarmBlackboard(
                     source_resource_name=resource.name,
                     signal_summary=analysis.get("essence", ""),
@@ -264,27 +261,40 @@ class ScoutAndForagerBee:
         signal: SwarmBlackboard,
         geo: str,
         analysis: dict = None,
+        source_override: str = None,
+        event_override: str = None,
         authors: list[str] = None,
         is_mainstream: bool = False
     ):
-        """Строгий порог векторного слияния (cosine_distance < 0.24), исключающий склейку разных тем"""
+        """Склейка сигналов с разных сайтов по вектору семантического ядра ИЛИ пересечению >= 2 специфических корней"""
         dist_col = TrendMemory.embedding.cosine_distance(signal.embedding).label("dist")
         stmt = select(TrendMemory, dist_col).order_by(dist_col).limit(1)
         row = (await db.execute(stmt)).first()
-        existing = row[0] if (row and row[1] is not None and row[1] < 0.24) else None
+        existing = row[0] if (row and row[1] is not None and row[1] < 0.35) else None
+
+        if not existing and signal.search_queries:
+            sig_stems = {k.lower()[:6] for k in signal.search_queries if len(k) >= 4}
+            recent_trends = (await db.execute(select(TrendMemory).order_by(TrendMemory.id.desc()).limit(80))).scalars().all()
+            for tr in recent_trends:
+                tr_stems = {k.lower()[:6] for k in (tr.keywords_multilang or []) if len(k) >= 4}
+                if len(sig_stems.intersection(tr_stems)) >= 2:
+                    existing = tr
+                    break
 
         now_iso = utcnow().isoformat()
-        primary_author = authors[0] if authors else signal.source_resource_name
+        src_name = source_override or signal.source_resource_name
+        ev_text = event_override or signal.signal_summary
+        primary_author = authors[0] if authors else src_name
         clean_title = (analysis or {}).get("title") or signal.signal_summary[:90]
         raw_essence = (analysis or {}).get("core_essence") or signal.signal_summary
 
         new_event = {
             "timestamp": now_iso,
             "date": utcnow().strftime("%Y-%m-%d %H:%M"),
-            "source": signal.source_resource_name,
+            "source": src_name,
             "author": primary_author,
             "geo": geo,
-            "event": signal.signal_summary
+            "event": ev_text
         }
 
         if not existing:
@@ -308,7 +318,7 @@ class ScoutAndForagerBee:
             if existing.lifecycle_status == "IGNORED_NOISE":
                 return
             hist = list(existing.delta_history or [])
-            if any(d.get("event") == signal.signal_summary and d.get("source") == signal.source_resource_name for d in hist):
+            if any(d.get("event") == ev_text and d.get("source") == src_name for d in hist):
                 return
             hist.append(new_event)
             existing.delta_history = hist
@@ -329,6 +339,9 @@ class ScoutAndForagerBee:
         await db.commit()
 
 
+# =====================================================================
+# 2. ПЧЕЛИНАЯ КОРОЛЕВА (QUEEN BEE — БАЛАНС УЛЬЯ И ПРОГРЕВ НИЖНИХ РЕСУРСОВ)
+# =====================================================================
 class QueenBeeAgent:
     def __init__(self, controller: "SwarmController"):
         self.agent_id = "Пчелиная Королева"
@@ -361,6 +374,9 @@ class QueenBeeAgent:
             await asyncio.sleep(45)
 
 
+# =====================================================================
+# 3. ПЧЕЛА-СТРАЖ (GUARD BEE — ИММУНИТЕТ УЛЬЯ, ЧИСТКА ЛОКОВ И КОННЕКТОРОВ)
+# =====================================================================
 class GuardBeeAgent:
     def __init__(self, controller: "SwarmController"):
         self.agent_id = "Пчела-Страж"
@@ -400,6 +416,9 @@ class GuardBeeAgent:
             await asyncio.sleep(50)
 
 
+# =====================================================================
+# 4. ПЧЕЛА-ПРИЁМЩИЦА (RECEIVER BEE — МАТЕМАТИКА БАЗЫ, Z-SCORE И RAG-ЗАВИСИМОСТИ)
+# =====================================================================
 class ReceiverMathBeeAgent:
     def __init__(self, controller: "SwarmController"):
         self.agent_id = "Пчела-Приёмщица (Математика)"
@@ -448,18 +467,17 @@ class ReceiverMathBeeAgent:
                     recent_trends = sorted(trends, key=lambda x: (x.acceleration_rate, x.id), reverse=True)[:60]
                     for i in range(len(recent_trends)):
                         t1 = recent_trends[i]
-                        kw1 = {k for k in (t1.keywords_multilang or []) if k[:5] not in TrendMathEngine.COMMON_NOISE_STEMS}
+                        kw1 = {k for k in (t1.keywords_multilang or []) if not TrendMathEngine.is_noise_stem(k[:6])}
                         for j in range(i + 1, len(recent_trends)):
                             t2 = recent_trends[j]
                             pair_key = tuple(sorted([t1.code, t2.code]))
                             if pair_key in already_paired:
                                 continue
-                            kw2 = {k for k in (t2.keywords_multilang or []) if k[:5] not in TrendMathEngine.COMMON_NOISE_STEMS}
+                            kw2 = {k for k in (t2.keywords_multilang or []) if not TrendMathEngine.is_noise_stem(k[:6])}
                             common_kw = kw1.intersection(kw2)
                             src1 = t1.delta_history[0].get("source", t1.origin_geo) if t1.delta_history else t1.origin_geo
                             src2 = t2.delta_history[0].get("source", t2.origin_geo) if t2.delta_history else t2.origin_geo
 
-                            # Связываем только если совпал нетривиальный термин в РАЗНЫХ источниках
                             if common_kw and src1 != src2:
                                 already_paired.add(pair_key)
                                 shared_str = ", ".join(list(common_kw)[:3])
@@ -494,6 +512,9 @@ class ReceiverMathBeeAgent:
             await asyncio.sleep(30)
 
 
+# =====================================================================
+# КОНТРОЛЛЕР УЛЬЯ (ДИНАМИЧЕСКОЕ МАСШТАБИРОВАНИЕ 1..100 РАЗВЕДЧИЦ)
+# =====================================================================
 class SwarmController:
     def __init__(self):
         self.is_running = False
