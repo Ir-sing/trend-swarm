@@ -1,10 +1,28 @@
 import os
+import re
 import json
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from litellm import acompletion
 from app.models import AgentRoleConfig, ConnectorCredential
 from app.math_engine import TrendMathEngine
+
+
+def safe_parse_llm_json(raw_str: str) -> dict:
+    """Надежно извлекает JSON-объект из ответа даже маленьких локальных моделей (убирает обёртки ```json ... ```)"""
+    if not raw_str:
+        return {}
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_str.strip(), flags=re.IGNORECASE | re.MULTILINE)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start : end + 1]
+    try:
+        data = json.loads(cleaned)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
 
 class DynamicModelRouter:
     @classmethod
@@ -17,7 +35,6 @@ class DynamicModelRouter:
         source_name: str = "Source",
         image_url: str = None
     ) -> dict:
-        # 1. Математический пред-фильтр кандидатов ДО вызова LLM (0 токенов на одиночных непроверенных статьях!)
         extracted = None
         if raw_items is not None:
             extracted = TrendMathEngine.extract_clean_facts_and_terms(raw_items, source_name=source_name)
@@ -40,7 +57,6 @@ class DynamicModelRouter:
         elif token_or_url:
             api_key = token_or_url
 
-        # 2. Экономичный вызов модели (~100 входных токенов, до 180 выходных)
         if cfg.provider in ("ollama", "vllm", "openai_compatible") or api_key or api_base:
             try:
                 messages = [
@@ -67,8 +83,8 @@ class DynamicModelRouter:
                     kwargs["api_key"] = api_key
 
                 resp = await acompletion(**kwargs)
-                parsed = json.loads(resp.choices[0].message.content)
-                if isinstance(parsed, dict) and parsed.get("title"):
+                parsed = safe_parse_llm_json(resp.choices[0].message.content)
+                if parsed and (parsed.get("title") or parsed.get("investment_or_product_thesis")):
                     if not parsed.get("multilang_keywords") and extracted:
                         parsed["multilang_keywords"] = extracted["keywords"]
                     return parsed
