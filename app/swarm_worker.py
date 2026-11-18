@@ -1,273 +1,671 @@
-from sqlalchemy import select, delete
+import asyncio
+import hashlib
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import select, or_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import AsyncSessionLocal
 from app.models import (
-    ConnectorCredential, AgentRoleConfig, SemanticBlock, 
-    Resource, AgentTelemetry, TrendMemory, MetaInsight, SwarmBlackboard
+    Resource, SemanticBlock, SwarmBlackboard, 
+    TrendMemory, AgentTelemetry, MetaInsight
 )
+from app.connectors import ResourceConnectorEngine
+from app.llm_router import DynamicModelRouter
+from app.math_engine import TrendMathEngine
 
 
-async def seed_initial_data(db: AsyncSession):
-    await db.execute(delete(TrendMemory).where(TrendMemory.title.like("Сигнал [%")))
-    await db.execute(delete(MetaInsight).where(MetaInsight.title.like("Сигнал [%")))
-    await db.execute(delete(MetaInsight).where(MetaInsight.title.like("Мета-связка:%Сигнал [%")))
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-    creds_defaults = [
-        ("llm_local", "Адрес локальной модели (Ollama / vLLM / Hermes) или API-ключ (по умолчанию: http://host.docker.internal:11434)", "http://host.docker.internal:11434"),
-        ("wb_mpstats", "MPStats / Wildberries API Token (если пусто — работает открытый поиск новинок WB)", ""),
-        ("ozon_api", "Ozon Analytics API Key", ""),
-        ("proxies", "Пул прокси (HTTP/SOCKS5) для Пчёл-Стражей", ""),
-    ]
-    for s_name, s_title, s_val in creds_defaults:
-        if not (await db.execute(select(ConnectorCredential).where(ConnectorCredential.service_name == s_name))).scalars().first():
-            db.add(ConnectorCredential(service_name=s_name, title=s_title, api_key_or_token=s_val))
 
-    roles_data = [
-        (
-            "dirty_scout",
-            "1. Пчёлы-Разведчицы (Полевой поиск изменений поведения потребителей и ранних сигналов)",
-            "ollama",
-            "qwen2.5:3b",
-            (
-                "Ты — Пчела-Разведчица проекта «Улей. Поиск трендов». Твоя задача — находить ранние изменения поведения потребителей, "
-                "зарождающиеся явления, мемы и инвестиционные сигналы ДО того, как о них напишут мейнстрим-СМИ.\n"
-                "ЧТО ИСКАТЬ:\n"
-                "1. Сдвиги в поведении людей: от чего отказываются, на что массово жалуются в отзывах, что начинают смешивать/делать сами, что ищут в комментариях.\n"
-                "2. Приоритет — рынок FMCG (еда, напитки, товары повседневного спроса, ритейл), но смотри широко: инсайты прячутся в неожиданных местах (форумы, субкультуры, наука, медицина, ИТ, зарубежные сообщества).\n"
-                "3. На инвест-площадках и в B2B ищи движения капитала: новые заводы, патенты, необычные R&D-вакансии, венчурные раунды, обсуждения публичных компаний.\n"
-                "4. Отсекай банальный вечный шум и пиши без словесной шелухи полными предложениями.\n"
-                "Отвечай СТРОГО в JSON: {\"is_anomaly\": true/false, \"confirmed\": true/false, \"title\": \"Четкое название явления\", "
-                "\"essence\": \"Суть сдвига поведения или инвестиционного факта\", \"summary\": \"Детали и потенциал\", "
-                "\"multilang_keywords\": [\"ключ_ru\", \"key_en\"]}"
-            )
-        ),
-        (
-            "vision_meme",
-            "2. Пчёлы-Разведчицы Визуала (Поиск вирусных картинок, мемов и новых продуктов)",
-            "ollama",
-            "qwen2.5:3b",
-            (
-                "Ты — Визуальная Пчела-Разведчица проекта «Улей». Анализируй текстовые описания мемов, видео и фото новинок с имиджбордов, форумов и Telegram. "
-                "Фиксируй зарождающиеся вирусные шаблоны и необычные товары до их выхода в масс-маркет. "
-                "Отвечай СТРОГО в JSON: {\"is_anomaly\": true/false, \"title\": \"Название визуального тренда\", "
-                "\"essence\": \"Суть визуального явления\", \"multilang_keywords\": [\"тег1\", \"tag2\"]}"
-            )
-        ),
-        (
-            "synthesizer",
-            "3. Пчёлы-Приёмщицы (Переработка нектара в Соты Памяти и фильтрация шума)",
-            "ollama",
-            "qwen2.5:3b",
-            (
-                "Ты — Пчела-Приёмщица проекта «Улей». Ты принимаешь сырые находки от разведчиц и рабочих пчёл-фуражиров, "
-                "убираешь информационную воду и запечатываешь чистый факт в Соты Памяти.\n"
-                "Связывай явление с направлением инвестиций: какие публичные компании на бирже (например, MGNT, FIVE, GCHE, ABRD, AQUA, AGRO, BELU и мировые аналоги), "
-                "производители сырья или венчурные сектора выиграют от этого тренда.\n"
-                "Отвечай СТРОГО в JSON: {\"title\": \"Название тренда\", \"core_essence\": \"Чистая аналитическая суть явления и инвестиционный вектор\", "
-                "\"delta_summary\": \"Какой новый подтверждающий факт добавился\"}"
-            )
-        ),
-        (
-            "foreman_brain",
-            "4. Пчелиная Королева (Управление феромонами приоритета и облетом всех 120 ресурсов)",
-            "ollama",
-            "qwen2.5:3b",
-            (
-                "Ты — Пчелиная Королева проекта «Улей». Ты направляешь разведчиц и рабочих пчёл во все 6 смысловых блоков, "
-                "чтобы ни один холодный ресурс внизу списка (инвест-площадки, форумы акций, патенты) не оставался без внимания. "
-                "Отвечай в JSON: {\"boost_block\": \"investments\"}"
-            )
-        ),
-        (
-            "memory_analyst",
-            "5. Ульевой Совет / Связь с Гермесом (Выведение кросс-трендовых зависимостей и Инвест-Гипотез)",
-            "ollama",
-            "qwen2.5:3b",
-            (
-                "Ты — аналитик зависимостей проекта «Улей». Ты сопоставляешь разные тренды из Сот Памяти (сравнивая их ускорение относительно базового замера) "
-                "и находишь неочевидные связки между сдвигами в поведении потребителей и направлениями инвестиций.\n"
-                "Отвечай СТРОГО в JSON: {\"title\": \"Название выявленной зависимости\", \"linked_codes\": [\"HIVE-0001\", \"HIVE-0002\"], "
-                "\"pattern_type\": \"PAIN_TO_INVESTMENT\", \"consumer_pain_summary\": \"Связь между сигналами и суть сдвига поведения\", "
-                "\"investment_or_product_thesis\": \"Направление инвестиций: сектора, тикеры, сырье или продуктовая ниша\", \"confidence_score\": 0.85}"
-            )
-        ),
-    ]
+def get_multi_site_note(delta_history: list[dict]) -> str:
+    now = utcnow()
+    mentions_24h = 0
+    sites_24h = []
 
-    for r_name, r_title, r_prov, r_mod, r_prompt in roles_data:
-        existing_role = (await db.execute(select(AgentRoleConfig).where(AgentRoleConfig.role_name == r_name))).scalars().first()
-        if not existing_role:
-            db.add(AgentRoleConfig(role_name=r_name, title=r_title, provider=r_prov, model_name=r_mod, credential_service="llm_local", system_prompt=r_prompt))
-        elif len(existing_role.system_prompt or "") < 250:
-            existing_role.title = r_title
-            existing_role.provider = r_prov
-            existing_role.model_name = r_mod
-            existing_role.credential_service = "llm_local"
-            existing_role.system_prompt = r_prompt
+    for ev in (delta_history or []):
+        ts_str = ev.get("timestamp")
+        try:
+            ev_time = datetime.fromisoformat(ts_str) if ts_str else now
+            if ev_time.tzinfo is None:
+                ev_time = ev_time.replace(tzinfo=timezone.utc)
+        except Exception:
+            ev_time = now
 
-    await db.execute(delete(AgentTelemetry))
-    db.add(AgentTelemetry(agent_id="Пчелиная Королева", agent_type="КОРОЛЕВА", state="IDLE", current_resource="Весь Улей (120 URL)", current_action="Распределение феромонов приоритета по всем 6 блокам"))
-    db.add(AgentTelemetry(agent_id="Пчела-Приёмщица (Математика)", agent_type="ПРИЁМЩИЦА", state="IDLE", current_resource="Соты Памяти & RAG", current_action="Расчет базовых частот, Z-Score, 2-й производной и RAG-зависимостей"))
-    db.add(AgentTelemetry(agent_id="Пчела-Страж", agent_type="СТРАЖ", state="IDLE", current_resource="Леток Улья & Сеть", current_action="Защита от ботов, лечение коннекторов и очистка локов"))
-    for i in range(1, 5):
-        db.add(AgentTelemetry(agent_id=f"Пчела-Разведчица #{i}", agent_type="РАЗВЕДЧИЦА / ФУРАЖИР", state="IDLE", current_resource="-", current_action="Готова к вылету"))
+        if (now - ev_time).total_seconds() / 3600.0 <= 24.0:
+            mentions_24h += 1
+            src = ev.get("source") or ev.get("geo") or ""
+            if src and src not in sites_24h:
+                sites_24h.append(src)
 
-    block_defs = [
-        ("consumer", "1. Потребительский опыт, Маркетплейсы и Отзовики", "WB, Ozon, ВкусВилл, Самокат, Отзовики, Amazon, iHerb"),
-        ("underground", "2. Форумы, Имиджборды, Мемы и Кустарные рецепты", "Двач, Пикабу, Reddit (20 сабреддитов), Азия, Латинская Америка, MENA"),
-        ("investments", "3. Инвестиции, Биржа, Тикеры, Венчур и Стартапы", "Смартлаб (акции РФ), Пульс, SeekingAlpha, AgFunder, FoodHack, мировые VC"),
-        ("b2b_patents", "4. B2B, Вакансии R&D, Заводы, Патенты и Наука", "API HH.ru, Минсельхозы регионов, Роспатент, PubMed, arXiv, ЭФКО, АБИ"),
-        ("niche_media", "5. Отраслевые СМИ и Исследовательские Центры", "BevNET, FoodNavigator (5 регионов), Milknews, Retail.ru, Роскачество, ВЦИОМ"),
-        ("mainstream_media", "6. Мейнстрим-СМИ (Калибратор / Фильтр «Уже в газетах»)", "РБК, Коммерсантъ, Ведомости, Forbes, ТАСС, CNBC"),
-    ]
-    blocks = {}
-    for b_type, b_name, b_desc in block_defs:
-        b_obj = (await db.execute(select(SemanticBlock).where(SemanticBlock.block_type == b_type))).scalars().first()
-        if not b_obj:
-            b_obj = SemanticBlock(name=b_name, block_type=b_type, description=b_desc)
-            db.add(b_obj)
-            await db.flush()
-        blocks[b_type] = b_obj
+    if len(sites_24h) >= 2 or mentions_24h >= 3:
+        return f"\n(Зафиксировано {mentions_24h} раз на {len(sites_24h)} ресурсах за 24 ч: {', '.join(sites_24h[:5])})"
+    return ""
 
-    existing_res = (await db.execute(select(Resource))).scalars().all()
-    if len(existing_res) >= 100:
-        await db.commit()
-        return
 
-    raw = [
-        ("consumer", "WB: Поисковые тренды Напитки и Клетчатка", "https://mpstats.io/api/wb/get/search", "wb_mpstats", "RU", ["#FMCG", "#Drinks"], 80.0, {"default_query": "напиток клетчатка пребиотик инулин без сахара"}),
-        ("consumer", "WB: Новинки Функциональные снеки и Десерты", "https://mpstats.io/api/wb/get/search", "wb_mpstats", "RU", ["#FMCG", "#Snacks"], 78.0, {"default_query": "функциональный снек без сахара пребиотик"}),
-        ("consumer", "WB: Новинки Адаптогены, Грибы и Ноотропы", "https://mpstats.io/api/wb/get/search", "wb_mpstats", "RU", ["#Supplements", "#Biohacking"], 78.0, {"default_query": "псиллиум инулин ежовик кордицепс габа"}),
-        ("consumer", "WB: Новинки Косметика (Пептиды и Спикулы)", "https://mpstats.io/api/wb/get/search", "wb_mpstats", "RU", ["#Cosmetics", "#Skincare"], 75.0, {"default_query": "пептиды спикулы центелла пробиотик"}),
-        ("consumer", "Ozon / Ozon Fresh: Продуктовые запуски", "https://t.me/s/ozonhq", "telegram_web", "RU", ["#Ecom", "#FMCG"], 74.0, {}),
-        ("consumer", "Яндекс Лавка: Новинки готовой еды и СТМ", "https://t.me/s/yandex_lavka", "telegram_web", "RU", ["#ReadyMeals", "#Delivery"], 76.0, {}),
-        ("consumer", "ВкусВилл: Отзывы и народные обзоры новинок", "https://t.me/s/vkusvill_official", "telegram_web", "RU", ["#ReadyMeals", "#CleanLabel"], 78.0, {}),
-        ("consumer", "Самокат: Новинки дарксторов и снеков", "https://t.me/s/samokat_15min", "telegram_web", "RU", ["#Delivery", "#FMCG"], 75.0, {}),
-        ("consumer", "Чижик (X5): Обзоры жестких дискаунтеров и СТМ", "https://t.me/s/chizhik_official", "telegram_web", "RU", ["#Discounter", "#Retail"], 74.0, {}),
-        ("consumer", "ТГ: Новинки с полок супермаркетов РФ", "https://t.me/s/produkty_v_setyah", "telegram_web", "RU", ["#Retail", "#NewArrivals"], 75.0, {}),
-        ("consumer", "IRecommend: Отзывы Продукты питания", "https://irecommend.ru/taxonomy/term/938/rss.xml", "rss_feed", "RU", ["#Reviews", "#FMCG"], 76.0, {}),
-        ("consumer", "IRecommend: Отзывы Диеты и БАДы", "https://irecommend.ru/taxonomy/term/87/rss.xml", "rss_feed", "RU", ["#Reviews", "#Supplements"], 75.0, {}),
-        ("consumer", "IRecommend: Отзывы Косметика", "https://irecommend.ru/taxonomy/term/30/rss.xml", "rss_feed", "RU", ["#Reviews", "#Cosmetics"], 72.0, {}),
-        ("consumer", "Otzovik: Отзывы о продуктах питания", "https://otzovik.com/reviews/produkti_pitaniya/", "html_scraper", "RU", ["#Reviews", "#ConsumerPain"], 75.0, {"item_selector": ".item"}),
-        ("consumer", "Otzovik: Отзывы о доставке готовой еды", "https://otzovik.com/reviews/dostavka_edi/", "html_scraper", "RU", ["#ReadyMeals", "#ConsumerPain"], 77.0, {"item_selector": ".item"}),
-        ("consumer", "Babyblog: Женский форум о питании и покупках", "https://www.babyblog.ru/community/lenta/food", "html_scraper", "RU", ["#Family", "#FMCG"], 70.0, {"item_selector": "article"}),
-        ("consumer", "Woman.ru: Форум диет и новых продуктов", "https://www.woman.ru/health/diets/forum/", "html_scraper", "RU", ["#Diet", "#Women"], 70.0, {"item_selector": ".card"}),
-        ("consumer", "Littleone: Форум покупок и супермаркетов", "https://forum.littleone.ru/forumdisplay.php?f=85", "html_scraper", "RU", ["#Retail", "#Family"], 68.0, {"item_selector": ".threadtitle"}),
-        ("consumer", "Amazon Movers & Shakers: Лидеры роста Grocery (США)", "https://www.amazon.com/gp/movers-and-shakers/grocery", "html_scraper", "US", ["#GlobalTrends", "#Grocery"], 78.0, {"item_selector": ".zg-grid-general-faceout"}),
-        ("consumer", "Amazon Movers & Shakers: Здоровье и БАДы (США)", "https://www.amazon.com/gp/movers-and-shakers/hpc", "html_scraper", "US", ["#Supplements", "#US"], 76.0, {"item_selector": ".zg-grid-general-faceout"}),
-        ("consumer", "iHerb Trending: Мировые хиты клетчатки и нутрицевтики", "https://www.iherb.com/catalog/topsellers", "html_scraper", "GLOBAL", ["#Fiber", "#Supplements"], 76.0, {"item_selector": ".product-cell-container"}),
-        ("consumer", "Product Hunt: Новые Food & Health приложения", "https://www.producthunt.com/feed?category=health-fitness", "rss_feed", "GLOBAL", ["#Apps", "#HealthTech"], 72.0, {}),
-    ]
-
-    for board, desc, tag, temp in [
-        ("cook", "Кулинария и крафтовые смеси", "#DIY", 78.0), ("fit", "Спортпит, белок и предтрены", "#Protein", 75.0),
-        ("fag", "Ранние вирусные тренды блогов", "#Viral", 70.0), ("b", "Генератор рунет-мемов и картинок", "#Memes", 70.0),
-        ("biz", "Малый бизнес, цеха и селлеры", "#Sellers", 76.0), ("sci", "Химия, ноотропы и ингредиенты", "#Science", 74.0)
-    ]:
-        raw.append(("underground", f"Двач (2ch.hk): /{board}/ ({desc})", f"https://2ch.hk/{board}/index.json", "json_api", "RU", [tag, "#Imageboard"], temp, {}))
-
-    raw.extend([
-        ("underground", "Пикабу: Свежее и вирусные посты РФ", "https://pikabu.ru/xmlfeeds.php?cmd=popular", "rss_feed", "RU", ["#Viral", "#RU"], 75.0, {}),
-        ("underground", "ЯПлакалъ: Народные видео и мемы РФ", "https://www.yaplakal.com/news.xml", "rss_feed", "RU", ["#Memes", "#Viral"], 70.0, {}),
-        ("underground", "KnowYourMeme: Мировой радар зарождающихся мемов", "https://knowyourmeme.com/newsfeed.rss", "rss_feed", "GLOBAL", ["#Memes", "#Global"], 74.0, {}),
-        ("underground", "ТГ: Тренды Китая Douyin и Xiaohongshu", "https://t.me/s/china_business_trends", "telegram_web", "CN", ["#China", "#Douyin"], 79.0, {}),
-    ])
-
-    for sub, geo, tag, temp in [
-        ("Supplements", "GLOBAL", "#Supplements", 78.0), ("foodscience", "GLOBAL", "#FoodTech", 80.0),
-        ("GutHealth", "GLOBAL", "#Fiber", 80.0), ("Biohackers", "GLOBAL", "#Biohacking", 78.0),
-        ("fermentation", "GLOBAL", "#Fermentation", 77.0), ("Ozempic", "US", "#GLP1", 79.0),
-        ("GroceryStores", "US", "#Retail", 74.0), ("snacks", "GLOBAL", "#Snacks", 76.0),
-        ("energydrinks", "GLOBAL", "#Drinks", 75.0), ("tea", "ASIA", "#AsianTrends", 73.0),
-        ("coffee", "GLOBAL", "#Coffee", 73.0), ("Nootropics", "GLOBAL", "#Nootropics", 76.0),
-        ("AsianBeauty", "ASIA", "#Cosmetics", 75.0), ("KoreanFood", "ASIA", "#Korea", 75.0),
-        ("JapaneseFood", "ASIA", "#Japan", 75.0), ("brasil", "LATAM", "#LatAm", 72.0),
-        ("mexico", "LATAM", "#LatAm", 72.0), ("india", "IN", "#India", 72.0),
-        ("dubai", "MENA", "#MENA", 74.0), ("Thailand", "ASIA", "#SEA", 73.0)
-    ]:
-        raw.append(("underground", f"Reddit: r/{sub} ({geo})", f"https://www.reddit.com/r/{sub}/new.json?limit=6&raw_json=1", "json_api", geo, [tag, "#Reddit"], temp, {}))
-
-    raw.append(("investments", "Smart-Lab: Все блоги инвесторов РФ", "https://smart-lab.ru/rss/all/", "rss_feed", "RU", ["#StocksRU", "#SmartMoney"], 82.0, {}))
-    for ticker, name in [("MGNT", "Магнит"), ("FIVE", "X5 Retail"), ("GCHE", "Черкизово"), ("ABRD", "Абрау-Дюрсо"), ("AQUA", "Инарктика"), ("AGRO", "Русагро"), ("BELU", "НоваБев")]:
-        raw.append(("investments", f"Smart-Lab: Форум акций {name} ({ticker})", f"https://smart-lab.ru/forum/{ticker}", "html_scraper", "RU", [f"#{ticker}", "#StocksRU"], 78.0, {"item_selector": ".comment_text"}))
-
-    raw.extend([
-        ("investments", "Т-Инвестиции (Пульс): Сентимент розничных инвесторов", "https://t.me/s/tinkoff_invest_official", "telegram_web", "RU", ["#Sentiment", "#StocksRU"], 78.0, {}),
-        ("investments", "Reddit: r/wallstreetbets (Биржевой хайп)", "https://www.reddit.com/r/wallstreetbets/new.json?limit=6&raw_json=1", "json_api", "US", ["#MemeStocks", "#US"], 74.0, {}),
-        ("investments", "Reddit: r/investing (Инвест-идеи сектора потребления)", "https://www.reddit.com/r/investing/new.json?limit=6&raw_json=1", "json_api", "GLOBAL", ["#Investing", "#Macro"], 76.0, {}),
-        ("investments", "Reddit: r/SecurityAnalysis (Отчеты инвестфондов)", "https://www.reddit.com/r/SecurityAnalysis/new.json?limit=6&raw_json=1", "json_api", "GLOBAL", ["#DeepValue", "#Equity"], 78.0, {}),
-        ("investments", "Seeking Alpha: Аналитика Consumer Staples & FMCG", "https://seekingalpha.com/market_currents.xml", "rss_feed", "US", ["#FMCG", "#Earnings"], 80.0, {}),
-        ("investments", "Hacker News (YC): Стартапы и технологии", "https://hnrss.org/newest?points=50", "rss_feed", "GLOBAL", ["#Startups", "#YC"], 77.0, {}),
-        ("investments", "TechCrunch Venture: Мировые венчурные сделки", "https://techcrunch.com/category/venture/feed/", "rss_feed", "GLOBAL", ["#Venture", "#Seed"], 78.0, {}),
-        ("investments", "AgFunderNews: Венчурные раунды FoodTech и AgTech", "https://agfundernews.com/feed", "rss_feed", "GLOBAL", ["#FoodTech", "#AgTech"], 82.0, {}),
-        ("investments", "Green Queen (Азия): Инвестиции в ферментацию и белки", "https://www.greenqueen.com.hk/feed/", "rss_feed", "ASIA", ["#Fermentation", "#AltProtein"], 80.0, {}),
-        ("investments", "FoodHack (Швейцария): Европейские сделки FoodTech", "https://foodhack.global/rss", "html_scraper", "EU", ["#FoodTech", "#EuropeVC"], 78.0, {"item_selector": "article, p"}),
-        ("investments", "EU-Startups: Раунды потребительских брендов Европы", "https://www.eu-startups.com/feed/", "rss_feed", "EU", ["#EuropeVC", "#D2C"], 76.0, {}),
-        ("investments", "LatAm List: Венчур Латинской Америки", "https://latamlist.com/feed/", "rss_feed", "LATAM", ["#LatAmVC", "#Startups"], 75.0, {}),
-        ("investments", "Wamda (MENA/Дубай): Инвестиции Ближнего Востока", "https://www.wamda.com/feed", "rss_feed", "MENA", ["#MENAVC", "#Dubai"], 75.0, {}),
-        ("investments", "Inc42 (Индия): Сделки D2C и FMCG Индии", "https://inc42.com/feed/", "rss_feed", "IN", ["#IndiaVC", "#FMCG"], 75.0, {}),
-    ])
-
-    for q_title, q_text in [
-        ("Технолог пищевого производства и R&D", "технолог пищевого производства OR разработка рецептур"),
-        ("Белок, Ферментация и Клетчатка", "ферментация OR изолят белка OR пищевые волокна OR пребиотик"),
-        ("Готовая еда и Фабрики-кухни", "фабрика кухня OR производство готовой еды OR технолог готовых блюд"),
-        ("Функциональные напитки и Розлив", "технолог безалкогольных напитков OR розлив напитков OR купажист"),
-        ("Разработка СТМ в ритейле", "менеджер СТМ продукты питания OR разработка СТМ FMCG"),
-    ]:
-        raw.append(("b2b_patents", f"HeadHunter API: Вакансии — {q_title}", "https://api.hh.ru/vacancies", "hh_vacancies", "RU", ["#Jobs", "#B2B"], 80.0, {"search_text": q_text}))
-
-    raw.extend([
-        ("b2b_patents", "Минсельхозпрод Московской области: Заводы и проекты", "https://msh.mosreg.ru/novosti", "html_scraper", "RU", ["#Gov", "#Factories"], 78.0, {"item_selector": ".news-item, article, h3"}),
-        ("b2b_patents", "Минсельхоз Краснодарского края: Проекты пищепрома Юга", "https://msh.krasnodar.ru/news/", "html_scraper", "RU", ["#Gov", "#Factories"], 76.0, {"item_selector": ".news-item, article"}),
-        ("b2b_patents", "Инвестпортал Татарстана: Новые производства", "https://tida.tatarstan.ru/rus/index.htm/news", "html_scraper", "RU", ["#Gov", "#Factories"], 75.0, {"item_selector": ".news-list, p"}),
-        ("b2b_patents", "Инвестпортал Новосибирской области: Проекты Сибири", "https://air-nso.ru/news/", "html_scraper", "RU", ["#Gov", "#Factories"], 75.0, {"item_selector": "article, h2"}),
-        ("b2b_patents", "АБИ Продакт (ABI.ru): Линии готовой еды и автоматизация", "https://www.abi.ru/press-center/news/", "html_scraper", "RU", ["#ReadyMeals", "#Automation"], 77.0, {"item_selector": ".news-item, p"}),
-        ("b2b_patents", "ГК ЭФКО (Hi-Food): Сладкие белки и биотехнологии", "https://www.efko.ru/news/", "html_scraper", "RU", ["#Biotech", "#SweetProteins"], 80.0, {"item_selector": "article, p"}),
-        ("b2b_patents", "Роспатент (ФИПС): Патентная активность в РФ", "https://rupto.ru/ru/news", "html_scraper", "RU", ["#Patents", "#IP"], 76.0, {"item_selector": ".views-row, article"}),
-        ("b2b_patents", "arXiv (Biomolecules): Препринты по белкам и ферментам", "https://export.arxiv.org/rss/q-bio.BM", "rss_feed", "GLOBAL", ["#Science", "#Preprints"], 74.0, {}),
-        ("b2b_patents", "PubMed: Клинические исследования клетчатки и микробиома", "https://pubmed.ncbi.nlm.nih.gov/rss/search/1/?term=prebiotic+fiber+beverage+microbiome", "rss_feed", "GLOBAL", ["#Clinical", "#Fiber"], 78.0, {}),
-        ("b2b_patents", "Nature Food: Научные прорывы в индустрии еды", "https://www.nature.com/natfood.rss", "rss_feed", "GLOBAL", ["#Science", "#FoodTech"], 76.0, {}),
-        ("b2b_patents", "Journal of Functional Foods: Новые ингредиенты", "https://rss.sciencedirect.com/publication/science/17564646", "rss_feed", "GLOBAL", ["#FunctionalFood", "#Ingredients"], 77.0, {}),
-        ("b2b_patents", "GitHub Trending: Открытые ИИ-инструменты", "https://mshibanami.github.io/GitHubTrendingRSS/daily/python.xml", "rss_feed", "GLOBAL", ["#OpenSource", "#AI"], 70.0, {}),
-        ("b2b_patents", "ТГ: Логистика и импорт сырья в РФ", "https://t.me/s/customs_logistics", "telegram_web", "RU", ["#SupplyChain", "#Import"], 74.0, {}),
-        ("b2b_patents", "ТГ: Поставщики торговых сетей и СТМ РФ", "https://t.me/s/retail_suppliers", "telegram_web", "RU", ["#B2B", "#RetailChains"], 76.0, {}),
-        ("b2b_patents", "ТГ: Сообщество пищевых технологов РФ", "https://t.me/s/food_technologist", "telegram_web", "RU", ["#Technologists", "#Formulation"], 78.0, {}),
-    ])
-
-    raw.extend([
-        ("niche_media", "BevNET: Мировой радар функциональных напитков", "https://www.bevnet.com/rss", "rss_feed", "US", ["#Drinks", "#FunctionalSoda"], 80.0, {}),
-        ("niche_media", "FoodNavigator Global/EU: Ингредиенты и тренды Европы", "https://www.foodnavigator.com/Info/FoodNavigator-RSS", "rss_feed", "EU", ["#Ingredients", "#EU"], 80.0, {}),
-        ("niche_media", "FoodNavigator-USA: Рынок белка, клетчатки и снеков США", "https://www.foodnavigator-usa.com/Info/FoodNavigator-USA-RSS", "rss_feed", "US", ["#USFood", "#Protein"], 78.0, {}),
-        ("niche_media", "FoodNavigator-Asia: Инновации напитков и еды Азии", "https://www.foodnavigator-asia.com/Info/FoodNavigator-Asia-RSS", "rss_feed", "ASIA", ["#AsiaFood", "#China"], 80.0, {}),
-        ("niche_media", "FoodNavigator-LatAm: Пищевая индустрия Латинской Америки", "https://www.foodnavigator-latam.com/Info/FoodNavigator-LATAM-RSS", "rss_feed", "LATAM", ["#LatAmFood", "#Brazil"], 76.0, {}),
-        ("niche_media", "NutraIngredients: Мировой радар пребиотиков и БАДов", "https://www.nutraingredients.com/Info/NutraIngredients-RSS", "rss_feed", "GLOBAL", ["#Nutraceuticals", "#Fiber"], 78.0, {}),
-        ("niche_media", "DairyReporter: Молочные инновации и протеиновые десерты", "https://www.dairyreporter.com/Info/DairyReporter-RSS", "rss_feed", "GLOBAL", ["#Dairy", "#HighProtein"], 75.0, {}),
-        ("niche_media", "BakeryAndSnacks: Мировые тренды снеков и выпечки", "https://www.bakeryandsnacks.com/Info/BakeryAndSnacks-RSS", "rss_feed", "GLOBAL", ["#Snacks", "#Bakery"], 75.0, {}),
-        ("niche_media", "Milknews.ru: Молочный рынок и переработка РФ", "https://milknews.ru/rss.xml", "rss_feed", "RU", ["#DairyRU", "#FMCG"], 76.0, {}),
-        ("niche_media", "Агроинвестор: Инвестпроекты и заводы АПК РФ", "https://www.agroinvestor.ru/rss/", "rss_feed", "RU", ["#AgroRU", "#Factories"], 78.0, {}),
-        ("niche_media", "Sfera.fm: Пищевая промышленность и упаковка РФ", "https://sfera.fm/rss", "rss_feed", "RU", ["#FoodIndustryRU", "#Packaging"], 76.0, {}),
-        ("niche_media", "Retail.ru: Торговые сети, СТМ и готовая еда РФ", "https://www.retail.ru/rss/news/", "rss_feed", "RU", ["#RetailRU", "#ReadyMeals"], 77.0, {}),
-        ("niche_media", "New-Retail.ru: E-grocery и ритейл-технологии", "https://new-retail.ru/rss/", "rss_feed", "RU", ["#EGrocery", "#RetailTech"], 75.0, {}),
-        ("niche_media", "Shopper's: Инсайды продовольственного ритейла и FMCG РФ", "https://t.me/s/shoppersmedia", "telegram_web", "RU", ["#InsidersRU", "#FMCG"], 80.0, {}),
-        ("niche_media", "Sostav.ru: Запуски брендов и маркетинг РФ", "https://www.sostav.ru/rss/", "rss_feed", "RU", ["#Brands", "#Launches"], 74.0, {}),
-        ("niche_media", "Роскачество: Исследования готовой еды и продуктов РФ", "https://rskrf.ru/news/", "html_scraper", "RU", ["#Quality", "#ReadyMeals"], 76.0, {"item_selector": ".news-item, article"}),
-        ("niche_media", "ВЦИОМ: Опросы потребительского поведения россиян", "https://wciom.ru/rss/all_news.xml", "rss_feed", "RU", ["#Sociology", "#RU"], 75.0, {}),
-        ("niche_media", "NTech / Исследования FMCG-ритейла РФ", "https://t.me/s/ntech_research", "telegram_web", "RU", ["#FMCGData", "#NTech"], 78.0, {}),
-    ])
-
-    raw.extend([
-        ("mainstream_media", "РБК: Главные новости бизнеса (Калибратор мейнстрима)", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", "rss_feed", "RU", ["#Mainstream", "#KillSwitch"], 60.0, {}),
-        ("mainstream_media", "Коммерсантъ: Деловые новости РФ", "https://www.kommersant.ru/RSS/news.xml", "rss_feed", "RU", ["#Mainstream", "#KillSwitch"], 60.0, {}),
-        ("mainstream_media", "Ведомости: Компании и рынки РФ", "https://www.vedomosti.ru/rss/news", "rss_feed", "RU", ["#Mainstream", "#KillSwitch"], 60.0, {}),
-        ("mainstream_media", "Forbes Russia: Крупный бизнес и тренды", "https://www.forbes.ru/newrss.xml", "rss_feed", "RU", ["#Mainstream", "#KillSwitch"], 58.0, {}),
-        ("mainstream_media", "ТАСС: Экономика и нацпроекты", "https://tass.ru/rss/v2.xml", "rss_feed", "RU", ["#Mainstream", "#KillSwitch"], 55.0, {}),
-        ("mainstream_media", "Lenta.ru: Массовая новостная повестка", "https://lenta.ru/rss/news", "rss_feed", "RU", ["#Mainstream", "#KillSwitch"], 55.0, {}),
-        ("mainstream_media", "Фонтанка: Деловой радар СЗФО", "https://www.fontanka.ru/fontanka.rss", "rss_feed", "RU", ["#Mainstream", "#KillSwitch"], 55.0, {}),
-        ("mainstream_media", "CNBC Global Business: Мировой фильтр мейнстрим-СМИ", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147", "rss_feed", "GLOBAL", ["#Mainstream", "#GlobalMedia"], 55.0, {}),
-    ])
-
-    existing_names = {r.name for r in existing_res}
-    for b_key, name, url, c_type, geo, tags, temp, cfg in raw:
-        if name not in existing_names:
-            db.add(Resource(block_id=blocks[b_key].id, name=name, url_or_id=url, connector_type=c_type, geo_region=geo, tags=tags, temperature=temp, connector_config=cfg))
-
+async def update_agent_telemetry(
+    db: AsyncSession,
+    agent_id: str,
+    agent_type: str,
+    state: str,
+    resource_name: str,
+    action: str,
+    inc_items: int = 0
+):
+    tel = (await db.execute(select(AgentTelemetry).where(AgentTelemetry.agent_id == agent_id))).scalars().first()
+    if not tel:
+        tel = AgentTelemetry(agent_id=agent_id, agent_type=agent_type, items_processed=0)
+        db.add(tel)
+    tel.agent_type = agent_type
+    tel.state = state
+    tel.current_resource = resource_name
+    tel.current_action = action
+    tel.items_processed = (tel.items_processed or 0) + inc_items
+    tel.updated_at = utcnow()
     await db.commit()
+
+
+class ScoutAndForagerBee:
+    def __init__(self, agent_id: str, controller: "SwarmController"):
+        self.agent_id = agent_id
+        self.controller = controller
+
+    async def run_forever(self):
+        while self.controller.is_running:
+            try:
+                async with AsyncSessionLocal() as db:
+                    handled = await self.forage_by_waggle_dance(db)
+                    if not handled and self.controller.is_running:
+                        await self.scout_flowers(db)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                async with AsyncSessionLocal() as db:
+                    await update_agent_telemetry(
+                        db, self.agent_id, "РАЗВЕДЧИЦА / ФУРАЖИР", "ERROR", "-", f"Помеха: {str(e)[:90]}"
+                    )
+            await asyncio.sleep(8)
+
+        async with AsyncSessionLocal() as db:
+            await update_agent_telemetry(db, self.agent_id, "РАЗВЕДЧИЦА / ФУРАЖИР", "STOPPED", "-", "В улье (На паузе)")
+
+    async def forage_by_waggle_dance(self, db: AsyncSession) -> bool:
+        """
+        Режим Рабочей пчелы (Фуражира):
+        1) Сначала проверяет кеш всех сайтов целевого блока.
+        2) Если в кеше совпадений нет, а в блоке есть поисковые API (hh_vacancies, wb_mpstats, telegram_web),
+           выполняет НАСТОЯЩИЙ целевой поисковый запрос (search_query) к площадке!
+        """
+        stmt = (
+            select(SwarmBlackboard)
+            .where(SwarmBlackboard.status == "ACTIVE")
+            .order_by(SwarmBlackboard.priority_boost.desc())
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        signal = (await db.execute(stmt)).scalars().first()
+        if not signal:
+            return False
+
+        unchecked = [b for b in (signal.target_block_types or []) if b not in (signal.checked_by_blocks or [])]
+        if not unchecked or not signal.search_queries:
+            signal.status = "PROMOTED_TO_MEMORY"
+            await db.commit()
+            return True
+
+        target_block = unchecked[0]
+        checked = list(signal.checked_by_blocks or [])
+        checked.append(target_block)
+        signal.checked_by_blocks = checked
+        if len(checked) >= len(signal.target_block_types or []):
+            signal.status = "PROMOTED_TO_MEMORY"
+        await db.commit()
+
+        block_resources = (
+            await db.execute(
+                select(Resource).join(SemanticBlock).where(
+                    SemanticBlock.block_type == target_block,
+                    Resource.is_active == True
+                )
+            )
+        ).scalars().all()
+
+        lead_query = signal.search_queries[0]
+        await update_agent_telemetry(
+            db, self.agent_id, "РАБОЧАЯ ПЧЕЛА (ФУРАЖИР)", "FORAGING", f"Блок [{target_block}]",
+            f"Целевой поиск ключа [{lead_query}] в блоке [{target_block}]"
+        )
+
+        hits = ResourceConnectorEngine.search_block_cache(block_resources, signal.search_queries)
+
+        # Если в кеше пусто — делаем настоящий живой запрос к поисковому коннектору этого блока (HH.ru / WB / TG)
+        if not hits and target_block in ("b2b_patents", "investments", "consumer"):
+            live_res = next((r for r in block_resources if r.connector_type in ("hh_vacancies", "wb_mpstats", "telegram_web")), None)
+            if live_res:
+                try:
+                    live_items = await ResourceConnectorEngine.fetch(db, live_res, search_query=lead_query)
+                    if live_items:
+                        hits.append((live_res, live_items))
+                except Exception:
+                    pass
+
+        for matched_res, matched_items in hits[:3]:
+            sample_text = " . ".join([i["text"][:200] for i in matched_items[:2]])
+            authors = list({i.get("author_id", matched_res.name) for i in matched_items[:2]})
+            await self.hand_over_to_receiver_bee(
+                db, signal, matched_res.geo_region,
+                source_override=matched_res.name,
+                event_override=sample_text[:240],
+                authors=authors,
+                is_mainstream=(target_block == "mainstream_media")
+            )
+        return True
+
+    async def scout_flowers(self, db: AsyncSession):
+        now = utcnow()
+        stmt = (
+            select(Resource, SemanticBlock.block_type)
+            .join(SemanticBlock)
+            .where(
+                Resource.is_active == True,
+                Resource.locked_by_agent == None,
+                or_(Resource.cooldown_until == None, Resource.cooldown_until < now)
+            )
+            .order_by(Resource.last_crawled_at.asc().nullsfirst(), Resource.temperature.desc())
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        row = (await db.execute(stmt)).first()
+        if not row:
+            await update_agent_telemetry(
+                db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", "В улье",
+                "Все 120 ресурсов проверены, ожидание новых публикаций..."
+            )
+            await asyncio.sleep(15)
+            return
+
+        resource, block_type = row[0], row[1]
+        resource.locked_by_agent = self.agent_id
+        resource.locked_at = now
+        await db.commit()
+
+        try:
+            tags_str = ", ".join(resource.tags or [])
+            await update_agent_telemetry(
+                db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "SCOUTING", resource.name,
+                f"Осмотр [{resource.connector_type}] ({resource.geo_region}) {tags_str}"
+            )
+            items = await ResourceConnectorEngine.fetch(db, resource)
+            resource.last_crawled_at = utcnow()
+            resource.fail_count = 0
+            resource.health_status = "HEALTHY"
+            resource.temperature = max(25.0, round(resource.temperature - 25.0, 1))
+
+            if not items:
+                resource.cooldown_until = utcnow() + timedelta(minutes=45)
+                await update_agent_telemetry(
+                    db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", resource.name,
+                    "304 Not Modified / Новых записей нет (Пауза 45 мин / 0 токенов)"
+                )
+                return
+
+            if block_type == "mainstream_media":
+                media_blob = " ".join([i["text"].lower() for i in items])
+                active_trends = (
+                    await db.execute(select(TrendMemory).where(TrendMemory.is_in_mainstream_media == False))
+                ).scalars().all()
+                flagged = 0
+                for tr in active_trends:
+                    stems = [k.lower()[:5] for k in (tr.keywords_multilang or []) if len(k) >= 4]
+                    if stems and any(s in media_blob for s in stems):
+                        tr.is_in_mainstream_media = True
+                        tr.lifecycle_status = "MAINSTREAM_PRICED_IN"
+                        flagged += 1
+                resource.cooldown_until = utcnow() + timedelta(minutes=45)
+                await update_agent_telemetry(
+                    db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "CALIBRATING", resource.name,
+                    f"Калибровка по СМИ (0 токенов): отсечено вышедших в тираж трендов: {flagged}",
+                    inc_items=len(items)
+                )
+                return
+
+            combined_text = " \n ".join([i["text"] for i in items[:6]])
+            authors = list({i.get("author_id", resource.name) for i in items[:6]})
+
+            content_hash = hashlib.md5(combined_text[:1500].encode("utf-8")).hexdigest()
+            if resource.last_content_hash == content_hash:
+                resource.cooldown_until = utcnow() + timedelta(minutes=45)
+                await update_agent_telemetry(
+                    db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", resource.name,
+                    "Контент без изменений — пропуск LLM (Пауза 45 мин / 0 токенов)"
+                )
+                return
+            resource.last_content_hash = content_hash
+
+            # Выбираем роль: если источник мемный/имиджборд или есть медиа-вложения — вызываем vision_meme, иначе dirty_scout
+            is_visual_res = "#Memes" in (resource.tags or []) or "[медиа:" in combined_text.lower()
+            scout_role = "vision_meme" if is_visual_res else "dirty_scout"
+
+            await update_agent_telemetry(
+                db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "ANALYZING", resource.name,
+                f"Проверка {len(items)} записей через мат. матрицу и роль [{scout_role}]...", inc_items=len(items)
+            )
+            analysis = await DynamicModelRouter.ask_agent(
+                db, scout_role, combined_text[:650], raw_items=items[:6], source_name=resource.name
+            )
+
+            if analysis.get("is_anomaly", False) and analysis.get("multilang_keywords"):
+                resource.temperature = min(90.0, round(resource.temperature + 30.0, 1))
+                resource.cooldown_until = utcnow() + timedelta(minutes=25)
+                semantic_core = " ".join(analysis.get("multilang_keywords", [])) * 2 + " " + analysis.get("title", "")
+                vec = DynamicModelRouter.compute_fast_vector(semantic_core)
+
+                new_sig = SwarmBlackboard(
+                    source_resource_name=resource.name,
+                    signal_summary=analysis.get("essence", ""),
+                    search_queries=analysis.get("multilang_keywords", []),
+                    embedding=vec,
+                    target_block_types=["investments", "b2b_patents", "mainstream_media"]
+                )
+                db.add(new_sig)
+                await db.flush()
+                await self.hand_over_to_receiver_bee(
+                    db, new_sig, resource.geo_region,
+                    analysis=analysis, authors=authors, is_mainstream=False
+                )
+            else:
+                resource.cooldown_until = utcnow() + timedelta(minutes=40)
+        except Exception as err:
+            resource.fail_count = (resource.fail_count or 0) + 1
+            resource.last_error = str(err)[:200]
+            resource.health_status = "DEGRADED"
+            resource.cooldown_until = utcnow() + timedelta(minutes=25)
+        finally:
+            resource.locked_by_agent = None
+            await db.commit()
+
+    async def hand_over_to_receiver_bee(
+        self,
+        db: AsyncSession,
+        signal: SwarmBlackboard,
+        geo: str,
+        analysis: dict = None,
+        source_override: str = None,
+        event_override: str = None,
+        authors: list[str] = None,
+        is_mainstream: bool = False
+    ):
+        """
+        Передача находки Пчеле-Приёмщице (роль synthesizer):
+        Склеивает сигналы с разных сайтов по вектору ИЛИ совпадению хотя бы 1 редкого (высокий IDF) корня!
+        """
+        dist_col = TrendMemory.embedding.cosine_distance(signal.embedding).label("dist")
+        stmt = select(TrendMemory, dist_col).order_by(dist_col).limit(1)
+        row = (await db.execute(stmt)).first()
+        existing = row[0] if (row and row[1] is not None and row[1] < 0.35) else None
+
+        if not existing and signal.search_queries:
+            sig_stems = {
+                k.lower()[:5] for k in signal.search_queries
+                if len(k) >= 4 and not TrendMathEngine.is_noise_stem(k[:5])
+            }
+            if sig_stems:
+                recent_trends = (await db.execute(select(TrendMemory).order_by(TrendMemory.id.desc()).limit(100))).scalars().all()
+                for tr in recent_trends:
+                    tr_stems = {
+                        k.lower()[:5] for k in (tr.keywords_multilang or [])
+                        if len(k) >= 4 and not TrendMathEngine.is_noise_stem(k[:5])
+                    }
+                    # Достаточно совпадения 1 специфического (не шумового) корня объекта, чтобы склеить сигналы в одну соту!
+                    if sig_stems.intersection(tr_stems):
+                        existing = tr
+                        break
+
+        now_iso = utcnow().isoformat()
+        src_name = source_override or signal.source_resource_name
+        ev_text = event_override or signal.signal_summary
+        primary_author = authors[0] if authors else src_name
+
+        # Вызываем роль synthesizer (Пчела-Приёмщица) для чистой упаковки карточки
+        synth_res = await DynamicModelRouter.ask_agent(
+            db, "synthesizer", f"Источник: {src_name} ({geo}). Находка: {ev_text}"
+        )
+        clean_title = synth_res.get("title") or (analysis or {}).get("title") or signal.signal_summary[:90]
+        raw_essence = synth_res.get("core_essence") or (analysis or {}).get("core_essence") or signal.signal_summary
+
+        initial_deltas = []
+        if not existing and signal.search_queries:
+            lead_st = signal.search_queries[0].lower()[:5]
+            prior_sightings = TrendMathEngine._candidate_sightings.get(lead_st, [])
+            for ps in prior_sightings[-4:]:
+                if ps["source"] != src_name:
+                    initial_deltas.append({
+                        "timestamp": datetime.fromtimestamp(ps["ts"], tz=timezone.utc).isoformat(),
+                        "date": datetime.fromtimestamp(ps["ts"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                        "source": ps["source"],
+                        "author": ps["author"],
+                        "geo": geo,
+                        "event": ps["text"][:240]
+                    })
+
+        new_event = {
+            "timestamp": now_iso,
+            "date": utcnow().strftime("%Y-%m-%d %H:%M"),
+            "source": src_name,
+            "author": primary_author,
+            "geo": geo,
+            "event": ev_text
+        }
+
+        if not existing:
+            count_all = len((await db.execute(select(TrendMemory.id))).scalars().all())
+            all_deltas = initial_deltas + [new_event]
+            note = get_multi_site_note(all_deltas)
+            db.add(TrendMemory(
+                code=f"HIVE-{count_all + 1:04d}",
+                title=clean_title,
+                core_essence=f"{raw_essence}{note}",
+                keywords_multilang=signal.search_queries,
+                embedding=signal.embedding,
+                origin_geo=geo,
+                geo_spread=[geo],
+                lifecycle_status="MAINSTREAM_PRICED_IN" if is_mainstream else ("ACCELERATING" if len(all_deltas) >= 2 else "CALIBRATING_BASELINE"),
+                is_in_mainstream_media=is_mainstream,
+                acceleration_rate=0.0,
+                velocity=0.0,
+                z_score=0.0,
+                delta_history=all_deltas
+            ))
+        else:
+            if existing.lifecycle_status == "IGNORED_NOISE":
+                return
+            hist = list(existing.delta_history or [])
+            if any(d.get("event") == ev_text and d.get("source") == src_name for d in hist):
+                return
+            hist.append(new_event)
+            existing.delta_history = hist
+
+            note = get_multi_site_note(hist)
+            base_body = (existing.core_essence or raw_essence).split("\n(Зафиксировано")[0]
+            existing.core_essence = f"{base_body}{note}"
+
+            spread = set(existing.geo_spread or [])
+            spread.add(geo)
+            existing.geo_spread = list(spread)
+            kw = set(existing.keywords_multilang or [])
+            kw.update(signal.search_queries or [])
+            existing.keywords_multilang = list(kw)[:10]
+            if is_mainstream:
+                existing.is_in_mainstream_media = True
+                existing.lifecycle_status = "MAINSTREAM_PRICED_IN"
+        await db.commit()
+
+
+class QueenBeeAgent:
+    """Пчелиная Королева: управляет приоритетами блоков через свою роль foreman_brain и подогревает нижние ресурсы"""
+    def __init__(self, controller: "SwarmController"):
+        self.agent_id = "Пчелиная Королева"
+        self.controller = controller
+
+    async def run_forever(self):
+        while self.controller.is_running:
+            try:
+                async with AsyncSessionLocal() as db:
+                    blocks = (await db.execute(select(SemanticBlock))).scalars().all()
+                    all_res = (await db.execute(select(Resource).where(Resource.is_active == True))).scalars().all()
+                    warmed_up = 0
+                    block_stats = []
+
+                    for b in blocks:
+                        b_res = [r for r in all_res if r.block_id == b.id]
+                        avg_t = sum(r.temperature for r in b_res) / max(1, len(b_res))
+                        block_stats.append(f"{b.block_type}: {avg_t:.1f}°")
+
+                    # Вызываем роль foreman_brain для выбора приоритетного смыслового блока
+                    queen_decision = await DynamicModelRouter.ask_agent(
+                        db, "foreman_brain", f"Температуры блоков: {', '.join(block_stats)}"
+                    )
+                    boost_target = queen_decision.get("boost_block")
+
+                    for r in all_res:
+                        if r.temperature < 55.0:
+                            r.temperature = round(r.temperature + 12.0, 1)
+                            warmed_up += 1
+
+                    if boost_target:
+                        target_b = next((b for b in blocks if b.block_type == boost_target), None)
+                        if target_b:
+                            for r in all_res:
+                                if r.block_id == target_b.id:
+                                    r.temperature = min(95.0, round(r.temperature + 10.0, 1))
+
+                    active_sigs = (await db.execute(select(SwarmBlackboard).where(SwarmBlackboard.status == "ACTIVE"))).scalars().all()
+                    for sig in active_sigs:
+                        sig.priority_boost = round((sig.priority_boost or 1.0) + 0.5, 1)
+
+                    await update_agent_telemetry(
+                        db, self.agent_id, "КОРОЛЕВА", "ORCHESTRATING",
+                        f"Поле из {len(all_res)} URL (Пчёл: {self.controller.scout_count})",
+                        f"Подогрето холодных URL: {warmed_up} | Приоритет Королевы: [{boost_target or 'равномерный'}] | Танцев на Доске: {len(active_sigs)}",
+                        inc_items=1
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"⚠️ QueenBee error: {e}")
+            await asyncio.sleep(45)
+
+
+class GuardBeeAgent:
+    def __init__(self, controller: "SwarmController"):
+        self.agent_id = "Пчела-Страж"
+        self.controller = controller
+
+    async def run_forever(self):
+        while self.controller.is_running:
+            try:
+                async with AsyncSessionLocal() as db:
+                    now = utcnow()
+                    locks, healed = 0, 0
+                    for r in (await db.execute(select(Resource))).scalars().all():
+                        if r.locked_by_agent and r.locked_at and (now - r.locked_at).total_seconds() > 90:
+                            r.locked_by_agent, r.locked_at = None, None
+                            locks += 1
+                        if r.health_status == "DEGRADED" or (r.fail_count and r.fail_count >= 3):
+                            r.health_status, r.fail_count = "REANIMATING", 0
+                            r.cooldown_until = now + timedelta(minutes=30)
+                            healed += 1
+
+                    await db.execute(
+                        delete(SwarmBlackboard).where(
+                            SwarmBlackboard.status == "PROMOTED_TO_MEMORY",
+                            SwarmBlackboard.created_at < (now - timedelta(hours=4))
+                        )
+                    )
+                    revived = await self.controller.ensure_scouts_alive()
+                    await update_agent_telemetry(
+                        db, self.agent_id, "СТРАЖ", "GUARDING", "Леток Улья & Сеть",
+                        f"Снято зависших локов: {locks} | Восстановлено URL: {healed} | В строю разведчиц: {self.controller.scout_count}",
+                        inc_items=locks + healed + revived
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"⚠️ GuardBee error: {e}")
+            await asyncio.sleep(50)
+
+
+class ReceiverMathBeeAgent:
+    def __init__(self, controller: "SwarmController"):
+        self.agent_id = "Пчела-Приёмщица (Математика)"
+        self.controller = controller
+
+    async def run_forever(self):
+        while self.controller.is_running:
+            try:
+                async with AsyncSessionLocal() as db:
+                    trends = (await db.execute(select(TrendMemory).where(TrendMemory.lifecycle_status != "IGNORED_NOISE"))).scalars().all()
+                    if not trends:
+                        await update_agent_telemetry(
+                            db, self.agent_id, "ПРИЁМЩИЦА", "IDLE", "Соты Памяти (0)",
+                            "Ожидание подтвержденных межсайтовых сигналов..."
+                        )
+                        await asyncio.sleep(25)
+                        continue
+
+                    accelerating_cnt = 0
+                    for tr in trends:
+                        deltas = tr.delta_history or []
+                        kpis = TrendMathEngine.calculate_kpis(deltas)
+                        tr.velocity = kpis.get("velocity", 0.0)
+                        tr.z_score = kpis.get("z_score", 0.0)
+                        tr.unique_authors_count = kpis.get("unique_authors", 1)
+                        tr.acceleration_rate = kpis.get("composite_acceleration", 0.0)
+                        tr.last_analyzed_at = utcnow()
+
+                        note = get_multi_site_note(deltas)
+                        base_body = (tr.core_essence or tr.title).split("\n(Зафиксировано")[0]
+                        tr.core_essence = f"{base_body}{note}"
+
+                        if tr.is_in_mainstream_media:
+                            tr.lifecycle_status = "MAINSTREAM_PRICED_IN"
+                        elif tr.acceleration_rate > 0:
+                            tr.lifecycle_status = "ACCELERATING"
+                            accelerating_cnt += 1
+                        else:
+                            tr.lifecycle_status = "CALIBRATING_BASELINE"
+                    await db.commit()
+
+                    existing_metas = (await db.execute(select(MetaInsight))).scalars().all()
+                    already_paired = {tuple(sorted(m.linked_trend_codes or [])) for m in existing_metas}
+
+                    new_pairs_found = 0
+                    recent_trends = sorted(trends, key=lambda x: (x.acceleration_rate, x.id), reverse=True)[:60]
+                    for i in range(len(recent_trends)):
+                        t1 = recent_trends[i]
+                        kw1 = {k for k in (t1.keywords_multilang or []) if not TrendMathEngine.is_noise_stem(k[:5])}
+                        for j in range(i + 1, len(recent_trends)):
+                            t2 = recent_trends[j]
+                            pair_key = tuple(sorted([t1.code, t2.code]))
+                            if pair_key in already_paired:
+                                continue
+                            kw2 = {k for k in (t2.keywords_multilang or []) if not TrendMathEngine.is_noise_stem(k[:5])}
+                            common_kw = kw1.intersection(kw2)
+                            src1 = t1.delta_history[0].get("source", t1.origin_geo) if t1.delta_history else t1.origin_geo
+                            src2 = t2.delta_history[0].get("source", t2.origin_geo) if t2.delta_history else t2.origin_geo
+
+                            if common_kw and src1 != src2:
+                                already_paired.add(pair_key)
+                                shared_str = ", ".join(list(common_kw)[:3])
+                                pair_prompt = f"Тренд 1 ({src1}): {t1.title}. Тренд 2 ({src2}): {t2.title}. Общий маркер: {shared_str}"
+                                llm_meta = await DynamicModelRouter.ask_agent(db, "memory_analyst", pair_prompt)
+
+                                db.add(MetaInsight(
+                                    title=llm_meta.get("title") or f"Межсайтовая зависимость по объекту [{shared_str}] ({t1.code} + {t2.code})",
+                                    linked_trend_codes=list(pair_key),
+                                    pattern_type="CROSS_CHANNEL_RAG",
+                                    consumer_pain_summary=llm_meta.get("consumer_pain_summary") or f"1) [{src1}]: {t1.title}\n2) [{src2}]: {t2.title}",
+                                    investment_or_product_thesis=llm_meta.get("investment_or_product_thesis") or (
+                                        f"Специфический маркер [{shared_str}] независимо проявился в разных источниках ({src1} и {src2}). "
+                                        f"Доступен для глубокого опроса через RAG-шлюз Гермеса: /api/hermes/search?q={list(common_kw)[0]}"
+                                    ),
+                                    confidence_score=float(llm_meta.get("confidence_score", 0.86))
+                                ))
+                                new_pairs_found += 1
+                                if new_pairs_found >= 2:
+                                    break
+                        if new_pairs_found >= 2:
+                            break
+                    if new_pairs_found > 0:
+                        await db.commit()
+
+                    await update_agent_telemetry(
+                        db, self.agent_id, "ПРИЁМЩИЦА", "IDLE", f"Соты Памяти ({len(trends)} трендов)",
+                        f"Ускоряются к базе: {accelerating_cnt} | На замере базы: {len(trends) - accelerating_cnt} | Новых межсайтовых связок: +{new_pairs_found}",
+                        inc_items=new_pairs_found
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"⚠️ ReceiverMathBee error: {e}")
+            await asyncio.sleep(30)
+
+
+class SwarmController:
+    def __init__(self):
+        self.is_running = False
+        self.scout_tasks: dict[str, asyncio.Task] = {}
+        self.special_tasks: list[asyncio.Task] = []
+        self.scout_count = 4
+
+    async def start(self, scout_count: int = None):
+        if scout_count is not None:
+            self.scout_count = max(1, min(100, scout_count))
+        if self.is_running:
+            await self.scale_scouts(self.scout_count)
+            return
+        self.is_running = True
+        async with AsyncSessionLocal() as db:
+            for r in (await db.execute(select(Resource))).scalars().all():
+                r.locked_by_agent = None
+            existing_trends = (await db.execute(select(TrendMemory))).scalars().all()
+            TrendMathEngine.warmup_from_db(list(existing_trends))
+            await db.commit()
+
+        for i in range(1, self.scout_count + 1):
+            aid = f"Пчела-Разведчица #{i}"
+            self.scout_tasks[aid] = asyncio.create_task(ScoutAndForagerBee(aid, self).run_forever())
+        self.special_tasks = [
+            asyncio.create_task(QueenBeeAgent(self).run_forever()),
+            asyncio.create_task(GuardBeeAgent(self).run_forever()),
+            asyncio.create_task(ReceiverMathBeeAgent(self).run_forever()),
+        ]
+
+    async def scale_scouts(self, new_count: int):
+        new_count = max(1, min(100, new_count))
+        old_count = self.scout_count
+        self.scout_count = new_count
+        if not self.is_running:
+            return
+        if new_count > old_count:
+            for i in range(old_count + 1, new_count + 1):
+                aid = f"Пчела-Разведчица #{i}"
+                if aid not in self.scout_tasks or self.scout_tasks[aid].done():
+                    self.scout_tasks[aid] = asyncio.create_task(ScoutAndForagerBee(aid, self).run_forever())
+        elif new_count < old_count:
+            async with AsyncSessionLocal() as db:
+                for i in range(new_count + 1, old_count + 1):
+                    aid = f"Пчела-Разведчица #{i}"
+                    task = self.scout_tasks.pop(aid, None)
+                    if task:
+                        task.cancel()
+                    tel = (await db.execute(select(AgentTelemetry).where(AgentTelemetry.agent_id == aid))).scalars().first()
+                    if tel:
+                        await db.delete(tel)
+                await db.commit()
+
+    async def ensure_scouts_alive(self) -> int:
+        revived = 0
+        if not self.is_running:
+            return 0
+        for i in range(1, self.scout_count + 1):
+            aid = f"Пчела-Разведчица #{i}"
+            t = self.scout_tasks.get(aid)
+            if not t or t.done():
+                self.scout_tasks[aid] = asyncio.create_task(ScoutAndForagerBee(aid, self).run_forever())
+                revived += 1
+        return revived
+
+    async def stop(self):
+        self.is_running = False
+        for t in list(self.scout_tasks.values()) + self.special_tasks:
+            t.cancel()
+        self.scout_tasks.clear()
+        self.special_tasks.clear()
+        async with AsyncSessionLocal() as db:
+            for tel in (await db.execute(select(AgentTelemetry))).scalars().all():
+                tel.state = "STOPPED"
+                tel.current_action = "В улье (Остановлена)"
+            await db.commit()
+
+
+swarm_controller = SwarmController()
