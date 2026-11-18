@@ -8,14 +8,22 @@ from app.math_engine import TrendMathEngine
 
 class DynamicModelRouter:
     @classmethod
-    async def ask_agent(cls, db: AsyncSession, role_name: str, user_payload: str, raw_items: list[dict] = None, image_url: str = None) -> dict:
-        # 1. Математический фильтр ДО вызова LLM (отсекает ~90% бытового и новостного шума за 0 токенов)
+    async def ask_agent(
+        cls,
+        db: AsyncSession,
+        role_name: str,
+        user_payload: str,
+        raw_items: list[dict] = None,
+        source_name: str = "Source",
+        image_url: str = None
+    ) -> dict:
+        # 1. Математический пред-фильтр кандидатов ДО вызова LLM (0 токенов на одиночных непроверенных статьях!)
         extracted = None
         if raw_items is not None:
-            extracted = TrendMathEngine.extract_clean_facts_and_terms(raw_items)
+            extracted = TrendMathEngine.extract_clean_facts_and_terms(raw_items, source_name=source_name)
             if not extracted.get("has_signal"):
                 return {"is_anomaly": False, "confirmed": False}
-            user_payload = extracted.get("compact_payload", user_payload[:500])
+            user_payload = extracted.get("compact_payload", user_payload[:450])
 
         cfg = (await db.execute(select(AgentRoleConfig).where(AgentRoleConfig.role_name == role_name))).scalars().first()
         if not cfg:
@@ -32,12 +40,12 @@ class DynamicModelRouter:
         elif token_or_url:
             api_key = token_or_url
 
-        # 2. Вызов локальной модели (или внешнего API) на сжатом тексте (~100 токенов)
+        # 2. Экономичный вызов модели (~100 входных токенов, до 180 выходных)
         if cfg.provider in ("ollama", "vllm", "openai_compatible") or api_key or api_base:
             try:
                 messages = [
                     {"role": "system", "content": cfg.system_prompt},
-                    {"role": "user", "content": user_payload[:650]}
+                    {"role": "user", "content": user_payload[:550]}
                 ]
                 model_str = cfg.model_name
                 if cfg.provider not in model_str and cfg.provider in ("ollama", "openrouter", "openai"):
@@ -47,7 +55,7 @@ class DynamicModelRouter:
                     "model": model_str,
                     "messages": messages,
                     "temperature": cfg.temperature,
-                    "max_tokens": 200,
+                    "max_tokens": 180,
                     "response_format": {"type": "json_object"},
                     "timeout": 20.0
                 }
@@ -67,7 +75,6 @@ class DynamicModelRouter:
             except Exception:
                 pass
 
-        # 3. Если локальная модель не запущена — отдаем чистый результат математического ядра
         if extracted and extracted.get("has_signal"):
             return {
                 "is_anomaly": True,
