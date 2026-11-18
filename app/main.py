@@ -196,7 +196,14 @@ async def change_trend_status(request: Request, code: str, status: str, db: Asyn
 async def get_all_resources(db: AsyncSession = Depends(get_db)):
     resources = (await db.execute(select(Resource).order_by(Resource.temperature.desc()))).scalars().all()
     creds = (await db.execute(select(ConnectorCredential))).scalars().all()
-    return {"resources": resources, "credentials": creds}
+    masked_creds = []
+    for c in creds:
+        val = c.api_key_or_token or ""
+        # URL локальной модели оставляем видимым, а секретные токены маскируем
+        if val and not val.startswith("http"):
+            val = "***" + val[-4:] if len(val) > 4 else "***"
+        masked_creds.append({"service_name": c.service_name, "title": c.title, "api_key_or_token": val})
+    return {"resources": resources, "credentials": masked_creds}
 
 @app.patch("/api/resources/{res_id}/toggle")
 async def toggle_resource(request: Request, res_id: int, db: AsyncSession = Depends(get_db)):
@@ -208,6 +215,8 @@ async def toggle_resource(request: Request, res_id: int, db: AsyncSession = Depe
 
 @app.post("/api/credentials")
 async def save_credential(request: Request, payload: CredentialUpdateSchema, db: AsyncSession = Depends(get_db)):
+    if payload.api_key_or_token.startswith("***"):
+        return {"status": "unchanged"}
     c = (await db.execute(select(ConnectorCredential).where(ConnectorCredential.service_name == payload.service_name))).scalars().first()
     if c:
         c.api_key_or_token = payload.api_key_or_token
@@ -444,7 +453,7 @@ async def admin_dashboard():
             </tr>
         `).join('');
     }
-    setInterval(loadSwarmStatus, 3500);
+    setInterval(() => { if (!document.hidden) loadSwarmStatus(); }, 6000);
     loadSwarmStatus();
 </script>
 </body>
