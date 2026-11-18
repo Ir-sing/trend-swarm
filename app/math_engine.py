@@ -7,29 +7,32 @@ from datetime import datetime, timezone
 
 
 class TrendMathEngine:
-    """
-    Математическое ядро Проекта «Улей»:
-    1) Прогревает частотную матрицу (_global_doc_freq) из БД при старте сервера (warmup_from_db),
-       чтобы фильтр IDF работал с первой же секунды после любого рестарта контейнера.
-    2) Отсекает общий фон языка по закону Ципфа (df / total_docs > 0.15 -> IDF = 0.0) без зашитых списков стоп-слов.
-    3) Фиксирует зарождение сигнала только при независимом появлении термина на >= 2 ресурсах или у >= 2 авторов.
-    4) Сравнивает текущую частоту (c_now) со средней базовой частотой прошлых отрезков (rate_base).
-    """
     _total_docs_seen: int = 0
     _global_doc_freq: Counter = Counter()
     _candidate_sightings: dict[str, list[dict]] = {}
 
     @classmethod
-    def warmup_from_db(cls, existing_texts: list[str]):
-        """Восстанавливает матрицу IDF из существующих записей БД при старте контейнера"""
-        if cls._total_docs_seen > 0 or not existing_texts:
+    def warmup_from_db(cls, existing_trends: list):
+        """Восстанавливает и матрицу IDF, и буфер кандидатов из БД при старте контейнера"""
+        if cls._total_docs_seen > 0 or not existing_trends:
             return
-        for txt in existing_texts:
-            stems = {w[:5] for w in re.findall(r"\b[a-zа-яё]{5,}\b", (txt or "").lower()) if not w.isdigit()}
+        now_ts = time.time()
+        for tr in existing_trends:
+            txt = f"{getattr(tr, 'title', '')} {getattr(tr, 'core_essence', '')}".lower()
+            stems = {w[:5] for w in re.findall(r"\b[a-zа-яё]{5,}\b", txt) if not w.isdigit()}
             if stems:
                 cls._total_docs_seen += 1
                 for st in stems:
                     cls._global_doc_freq[st] += 1
+            for kw in (getattr(tr, "keywords_multilang", None) or []):
+                st = kw.lower()[:5]
+                for ev in (getattr(tr, "delta_history", None) or [])[-3:]:
+                    cls._candidate_sightings.setdefault(st, []).append({
+                        "ts": now_ts - 600,
+                        "source": ev.get("source", "DB"),
+                        "author": ev.get("author", "DB"),
+                        "text": ev.get("event", getattr(tr, "title", ""))[:400]
+                    })
 
     @classmethod
     def get_stem_idf(cls, stem: str) -> float:
@@ -134,10 +137,10 @@ class TrendMathEngine:
         lead_sightings = cls._candidate_sightings.get(lead_stem, [])
         best_post = lead_sightings[-1]["text"] if lead_sightings else valid_items[0]["text"]
 
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", best_post) if len(s.strip()) > 25]
-        clean_title = sentences[0] if sentences else best_post
-        if len(clean_title) > 105:
-            clean_title = clean_title[:105].rsplit(" ", 1)[0] + "..."
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", best_post) if len(s.strip()) > 20]
+        # Выбираем строго то предложение, в котором содержится сам ключевой термин lead_stem!
+        target_sentence = next((s for s in sentences if lead_stem in s.lower()), sentences[0] if sentences else best_post)
+        clean_title = target_sentence[:105].rsplit(" ", 1)[0] + "..." if len(target_sentence) > 105 else target_sentence
 
         clean_body = " ".join(sentences[:2]) if sentences else best_post
         if len(clean_body) > 350:
