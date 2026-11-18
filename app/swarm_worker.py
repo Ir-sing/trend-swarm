@@ -1,7 +1,7 @@
 import asyncio
 import hashlib
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal
 from app.models import Resource, SemanticBlock, SwarmBlackboard, TrendMemory, AgentTelemetry, MetaInsight
@@ -72,19 +72,20 @@ class AutonomousScout:
 
             try:
                 q = signal.search_queries[0] if signal.search_queries else ""
-                await update_agent_telemetry(db, self.agent_id, "SCOUT", "CROSS_CHECKING", resource.name, f"Проверка сигнала '{signal.signal_summary[:40]}...' в [{target_block}] (из кеша)")
+                await update_agent_telemetry(db, self.agent_id, "SCOUT", "CROSS_CHECKING", resource.name, f"Проверка сигнала '{signal.signal_summary[:40]}...' в [{target_block}]")
                 items = await ResourceConnectorEngine.fetch(db, resource, search_query=q)
                 checked = list(signal.checked_by_blocks)
                 checked.append(target_block)
                 signal.checked_by_blocks = checked
                 if items:
                     sample_text = " | ".join([i["text"][:200] for i in items[:4]])
+                    authors = list({i.get("author_id", resource.name) for i in items[:4]})
                     analysis = await DynamicModelRouter.ask_agent(db, "dirty_scout", f"Сигнал: {signal.signal_summary}. Найдено в {resource.name}: {sample_text}")
                     if analysis.get("confirmed", False):
                         conf = list(signal.confirmations)
                         conf.append({"block": target_block, "resource": resource.name, "geo": resource.geo_region, "details": analysis.get("summary", sample_text[:150])})
                         signal.confirmations = conf
-                        await self.record_to_memory(db, signal, resource.geo_region, is_mainstream=(target_block == "mainstream_media"))
+                        await self.record_to_memory(db, signal, resource.geo_region, authors=authors, is_mainstream=(target_block == "mainstream_media"))
             except Exception as err:
                 resource.fail_count = (resource.fail_count or 0) + 1
                 resource.last_error = str(err)[:200]
@@ -104,7 +105,7 @@ class AutonomousScout:
         )
         resource = (await db.execute(stmt)).scalars().first()
         if not resource:
-            await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", "-", "Все активные URL проверены (Режим экономии трафика и токенов)...")
+            await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", "-", "Все активные URL проверены (Режим экономии трафика)...")
             await asyncio.sleep(6)
             return
 
@@ -121,17 +122,17 @@ class AutonomousScout:
             resource.health_status = "HEALTHY"
 
             if not items:
-                # Если вернулся 304 Not Modified или пусто — ставим паузу 15 минут (0 байт и 0 токенов)
                 resource.temperature = max(15.0, round(resource.temperature * 0.95, 1))
                 resource.cooldown_until = utcnow() + timedelta(minutes=15)
                 await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", resource.name, "304 Not Modified / Новых данных нет (0 байт / 0 токенов)")
                 return
 
-            combined_text = " \\n ".join([f"[{i['author_id']}]: {i['text']}" for i in items[:8]])
+            combined_text = " \n ".join([f"[{i['author_id']}]: {i['text']}" for i in items[:8]])
+            authors = list({i.get("author_id", resource.name) for i in items[:8]})
             content_hash = hashlib.md5(combined_text[:1500].encode("utf-8")).hexdigest()
             if resource.last_content_hash == content_hash:
                 resource.cooldown_until = utcnow() + timedelta(minutes=20)
-                await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", resource.name, "Контент не изменился — пропуск LLM (Пауза 20 мин)")
+                await update_agent_telemetry(db, self.agent_id, "SCOUT", "IDLE", resource.name, "Контент не изменился — пропуск LLM (0 токенов)")
                 return
             resource.last_content_hash = content_hash
 
@@ -139,12 +140,12 @@ class AutonomousScout:
             role = "vision_meme" if first_img else "dirty_scout"
 
             await update_agent_telemetry(db, self.agent_id, "SCOUT", "ANALYZING", resource.name, f"Анализ {len(items)} свежих записей ролью [{role}]...", inc_items=len(items))
-            analysis = await DynamicModelRouter.ask_agent(db, role, f"Источник: {resource.name} ({resource.geo_region}). Данные:\\n{combined_text[:2500]}", image_url=first_img)
+            analysis = await DynamicModelRouter.ask_agent(db, role, f"Источник: {resource.name} ({resource.geo_region}). Данные:\n{combined_text[:2500]}", image_url=first_img)
 
             if analysis.get("is_anomaly", False):
                 resource.temperature = min(100.0, round(resource.temperature + 15.0, 1))
                 resource.cooldown_until = utcnow() + timedelta(minutes=10)
-                vec = DynamicModelRouter.compute_fast_vector(analysis.get("essence", combined_text[:200]))
+                vec = DynamicModelRouter.compute_fast_vector(analysis.get("essence", combined_text[:300]))
                 new_sig = SwarmBlackboard(
                     source_resource_name=resource.name,
                     signal_summary=analysis.get("essence", "Обнаружен всплеск"),
@@ -154,7 +155,7 @@ class AutonomousScout:
                 )
                 db.add(new_sig)
                 await db.flush()
-                await self.record_to_memory(db, new_sig, resource.geo_region, is_mainstream=False)
+                await self.record_to_memory(db, new_sig, resource.geo_region, authors=authors, is_mainstream=False)
             else:
                 resource.temperature = max(15.0, round(resource.temperature * 0.95, 1))
                 resource.cooldown_until = utcnow() + timedelta(minutes=20)
@@ -167,14 +168,19 @@ class AutonomousScout:
             resource.locked_by_agent = None
             await db.commit()
 
-    async def record_to_memory(self, db: AsyncSession, signal: SwarmBlackboard, geo: str, is_mainstream: bool):
-        stmt = select(TrendMemory).order_by(TrendMemory.embedding.cosine_distance(signal.embedding)).limit(1)
-        existing = (await db.execute(stmt)).scalars().first()
-        synthesis = await DynamicModelRouter.ask_agent(db, "synthesizer", f"Сигнал из {signal.source_resource_name} ({geo}): {signal.signal_summary}. Подтверждения: {signal.confirmations}")
+    async def record_to_memory(self, db: AsyncSession, signal: SwarmBlackboard, geo: str, authors: list[str] = None, is_mainstream: bool = False):
+        # Честный поиск смыслового дубля по косинусному расстоянию в pgvector (порог < 0.38)
+        dist_col = TrendMemory.embedding.cosine_distance(signal.embedding).label("dist")
+        stmt = select(TrendMemory, dist_col).order_by(dist_col).limit(1)
+        row = (await db.execute(stmt)).first()
+        existing = row[0] if (row and row[1] is not None and row[1] < 0.38) else None
 
+        synthesis = await DynamicModelRouter.ask_agent(db, "synthesizer", f"Сигнал из {signal.source_resource_name} ({geo}): {signal.signal_summary}. Подтверждения: {signal.confirmations}")
         now_iso = utcnow().isoformat()
-        if not existing or existing.title != synthesis.get("title", signal.signal_summary[:60]):
-            count_all = len((await db.execute(select(TrendMemory))).scalars().all())
+        primary_author = authors[0] if authors else signal.source_resource_name
+
+        if not existing:
+            count_all = len((await db.execute(select(TrendMemory.id))).scalars().all())
             db.add(TrendMemory(
                 code=f"TREND-{count_all + 1:04d}",
                 title=synthesis.get("title", signal.signal_summary[:70]),
@@ -186,17 +192,34 @@ class AutonomousScout:
                 lifecycle_status="MAINSTREAM_PRICED_IN" if is_mainstream else "NEW_SIGNAL",
                 is_in_mainstream_media=is_mainstream,
                 acceleration_rate=1.0,
-                delta_history=[{"timestamp": now_iso, "date": utcnow().strftime("%Y-%m-%d %H:%M"), "source": signal.source_resource_name, "geo": geo, "event": signal.signal_summary}]
+                delta_history=[{
+                    "timestamp": now_iso,
+                    "date": utcnow().strftime("%Y-%m-%d %H:%M"),
+                    "source": signal.source_resource_name,
+                    "author": primary_author,
+                    "geo": geo,
+                    "event": signal.signal_summary
+                }]
             ))
         else:
             if existing.lifecycle_status == "IGNORED_NOISE":
                 return
             hist = list(existing.delta_history or [])
-            hist.append({"timestamp": now_iso, "date": utcnow().strftime("%Y-%m-%d %H:%M"), "source": signal.source_resource_name, "geo": geo, "event": synthesis.get("delta_summary", signal.signal_summary)})
+            hist.append({
+                "timestamp": now_iso,
+                "date": utcnow().strftime("%Y-%m-%d %H:%M"),
+                "source": signal.source_resource_name,
+                "author": primary_author,
+                "geo": geo,
+                "event": synthesis.get("delta_summary", signal.signal_summary)
+            })
             existing.delta_history = hist
             spread = set(existing.geo_spread or [])
             spread.add(geo)
             existing.geo_spread = list(spread)
+            kw = set(existing.keywords_multilang or [])
+            kw.update(signal.search_queries or [])
+            existing.keywords_multilang = list(kw)[:12]
             if is_mainstream:
                 existing.is_in_mainstream_media = True
                 existing.lifecycle_status = "MAINSTREAM_PRICED_IN"
@@ -223,7 +246,6 @@ class ForemanAgent:
                         if avg_t < 45.0:
                             for r in r_list:
                                 r.temperature = min(90.0, round(r.temperature + 15.0, 1))
-                                # ВАЖНО: Не сбрасываем cooldown_until, чтобы не провоцировать лишний сетевой трафик!
                     active_sigs = (await db.execute(select(SwarmBlackboard).where(SwarmBlackboard.status == "ACTIVE"))).scalars().all()
                     for sig in active_sigs:
                         sig.priority_boost = round((sig.priority_boost or 1.0) + 0.5, 1)
@@ -253,8 +275,10 @@ class ReanimatorAgent:
                             r.health_status, r.fail_count = "REANIMATING", 0
                             r.cooldown_until = now + timedelta(minutes=15)
                             healed += 1
+                    # Очистка отработанных записей Доски старше 12 часов, чтобы БД не пухла
+                    await db.execute(delete(SwarmBlackboard).where(SwarmBlackboard.status == "PROMOTED_TO_MEMORY", SwarmBlackboard.created_at < (now - timedelta(hours=12))))
                     revived = await self.controller.ensure_scouts_alive()
-                    await update_agent_telemetry(db, self.agent_id, "REANIMATOR", "HEALING", "Инфраструктура & Трафик-контроль", f"Снято зомби-локов: {locks} | Переведено в щадящий режим: {healed} | Поднято ищеек: {revived}", inc_items=locks+healed+revived)
+                    await update_agent_telemetry(db, self.agent_id, "REANIMATOR", "HEALING", "Инфраструктура & БД", f"Снято зомби-локов: {locks} | Восстановлено URL: {healed} | Поднято ищеек: {revived}", inc_items=locks+healed+revived)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -293,16 +317,16 @@ class MemoryAnalystAgent:
                     state_sig = "|".join([f"{t.code}:{len(t.delta_history or [])}" for t in sorted(trends, key=lambda x: x.code)])
                     state_hash = hashlib.md5(state_sig.encode("utf-8")).hexdigest()
                     if self.last_state_hash == state_hash:
-                        await update_agent_telemetry(db, self.agent_id, "MEMORY_ANALYST", "IDLE", f"Файл Памяти ({len(trends)} трендов)", "Z-Score пересчитан (Новых дельт нет — 0 байт / 0 токенов)")
+                        await update_agent_telemetry(db, self.agent_id, "MEMORY_ANALYST", "IDLE", f"Файл Памяти ({len(trends)} трендов)", "Z-Score и производные пересчитаны (Новых дельт нет — 0 токенов)")
                         await asyncio.sleep(20)
                         continue
                     self.last_state_hash = state_hash
 
                     if len(trends) >= 2:
                         top_t = sorted(trends, key=lambda x: x.acceleration_rate, reverse=True)[:8]
-                        dump = "\\n".join([f"- [{t.code}] (Z={t.z_score}, V={t.velocity}, Score={t.acceleration_rate}): {t.title} | {t.core_essence}" for t in top_t])
+                        dump = "\n".join([f"- [{t.code}] (Z={t.z_score}, V={t.velocity}, Дельт={len(t.delta_history or [])}): {t.title} | {t.core_essence}" for t in top_t])
                         await update_agent_telemetry(db, self.agent_id, "MEMORY_ANALYST", "SYNTHESIZING", f"Файл Памяти ({len(trends)} трендов)", "Сшивка кросс-трендовых инвестиционных гипотез...", inc_items=len(top_t))
-                        meta_res = await DynamicModelRouter.ask_agent(db, "memory_analyst", f"Свяжи тренды из Файла Памяти в инвестиционную гипотезу:\\n{dump}")
+                        meta_res = await DynamicModelRouter.ask_agent(db, "memory_analyst", f"Свяжи тренды из Файла Памяти в инвестиционную гипотезу:\n{dump}")
                         codes = meta_res.get("linked_codes") or [t.code for t in top_t[:3]]
                         title = meta_res.get("title") or f"Мета-связка: {' + '.join(codes)} ({top_t[0].title[:35]})"
                         if not (await db.execute(select(MetaInsight).where(MetaInsight.title == title))).scalars().first():
