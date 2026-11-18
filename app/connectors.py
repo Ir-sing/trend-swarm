@@ -1,11 +1,13 @@
 import time
 import json
+import hashlib
 import httpx
 import feedparser
 from bs4 import BeautifulSoup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Resource, ConnectorCredential
+
 
 class ResourceConnectorEngine:
     _client: httpx.AsyncClient | None = None
@@ -37,11 +39,7 @@ class ResourceConnectorEngine:
 
     @classmethod
     def search_block_cache(cls, resources: list[Resource], keywords: list[str]) -> list[tuple[Resource, list[dict]]]:
-        """
-        Мгновенный поиск совпадений сразу по ВСЕМ закешированным сайтам целевого блока (0 байт сетевого трафика!).
-        Проверяет вхождение корней ключевых слов (минимум 5 символов).
-        """
-        stems = [k.lower()[:6] for k in (keywords or []) if len(k.strip()) >= 4]
+        stems = [k.lower()[:5] for k in (keywords or []) if len(k.strip()) >= 4]
         if not stems:
             return []
 
@@ -108,19 +106,18 @@ class ResourceConnectorEngine:
         if len(cls._items_cache) > cls.MAX_CACHE_KEYS:
             cls._items_cache = {k: v for k, v in cls._items_cache.items() if (now - v[0]) < cls.CACHE_TTL_SECONDS}
 
-        if resource.id in cls._items_cache:
+        ctype = resource.connector_type
+        # Для статических лент при наличии свежего кеша проверяем кеш; для поисковых API (hh_vacancies, wb_mpstats, telegram_web) при search_query делаем живой запрос!
+        if resource.id in cls._items_cache and not (search_query and ctype in ("hh_vacancies", "wb_mpstats", "telegram_web")):
             cached_time, cached_items = cls._items_cache[resource.id]
             if (now - cached_time) < cls.CACHE_TTL_SECONDS:
                 if search_query:
-                    q_stem = search_query.lower()[:6]
-                    # ИСПРАВЛЕНО: Возвращаем ТОЛЬКО реальные совпадения (никаких cached_items[:4] при отсутствии совпадений!)
+                    q_stem = search_query.lower()[:5]
                     return [i for i in cached_items if q_stem in i["text"].lower()]
                 return cached_items
 
         proxy_cred = await cls.get_credentials(db, "proxies")
         proxy_url = proxy_cred.api_key_or_token.strip() if (proxy_cred and proxy_cred.api_key_or_token) else ""
-
-        ctype = resource.connector_type
         cfg = resource.connector_config or {}
         items = []
 
@@ -135,30 +132,34 @@ class ResourceConnectorEngine:
             if status == 200 and raw_bytes:
                 data = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
                 items = [{
-                    "author_id": v.get("employer", {}).get("name", "company"),
+                    "author_id": v.get("employer", {}).get("name", f"hh_{v.get('id')}"),
                     "text": f"Компания: {v.get('employer', {}).get('name')}. Вакансия: {v.get('name')}. Требования: {v.get('snippet', {}).get('requirement')}"
                 } for v in data.get("items", [])[:6]]
 
         elif ctype == "wb_mpstats":
             cred = await cls.get_credentials(db, "wb_mpstats")
-            if cred and cred.api_key_or_token:
+            if cred and cred.api_key_or_token and not search_query:
                 status, raw_bytes = await cls.fetch_raw_capped(resource.url_or_id, extra_headers={"X-Mpstats-TOKEN": cred.api_key_or_token}, proxy_url=proxy_url)
                 if status == 200 and raw_bytes:
                     data = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
-                    items = [{"author_id": "wb_mpstats", "text": str(item)} for item in data[:8]]
+                    items = [{"author_id": f"wb_{idx}", "text": str(item)} for idx, item in enumerate(data[:8])]
             else:
                 q = search_query or cfg.get("default_query", "напиток клетчатка протеин снек")
                 wb_url = f"https://search.wb.ru/exactmatch/ru/common/v7/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={q}&resultset=catalog&sort=Newly"
                 status, raw_bytes = await cls.fetch_raw_capped(wb_url, use_304=(search_query is None), proxy_url=proxy_url)
                 if status == 200 and raw_bytes:
-                    data = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
-                    items = [{
-                        "author_id": p.get("brand", "seller"),
-                        "text": f"Новинка WB: {p.get('name')} | Бренд: {p.get('brand')} | Отзывов: {p.get('feedbacks')}"
-                    } for p in data.get("data", {}).get("products", [])[:8]]
+                    try:
+                        data = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
+                        items = [{
+                            "author_id": p.get("brand") or f"wb_{p.get('id')}",
+                            "text": f"Новинка WB: {p.get('name')} | Бренд: {p.get('brand')} | Отзывов: {p.get('feedbacks')}"
+                        } for p in data.get("data", {}).get("products", [])[:8]]
+                    except Exception:
+                        items = []
 
         elif ctype == "telegram_web":
-            status, raw_bytes = await cls.fetch_raw_capped(resource.url_or_id, use_304=True, proxy_url=proxy_url)
+            url = f"{resource.url_or_id}?q={search_query}" if search_query else resource.url_or_id
+            status, raw_bytes = await cls.fetch_raw_capped(url, use_304=(search_query is None), proxy_url=proxy_url)
             if status == 200 and raw_bytes:
                 soup = BeautifulSoup(raw_bytes.decode("utf-8", errors="ignore"), "html.parser")
                 for msg in soup.select(".tgme_widget_message")[-8:]:
@@ -187,7 +188,7 @@ class ResourceConnectorEngine:
                     for e in feed.entries[:6]:
                         entry_soup = BeautifulSoup(e.get("summary", ""), "html.parser")
                         items.append({
-                            "author_id": e.get("author", "redditor"),
+                            "author_id": e.get("author", f"reddit_{hashlib.md5(e.get('title', '').encode()).hexdigest()[:6]}"),
                             "text": f"{e.get('title', '')}. {entry_soup.get_text(' ', strip=True)[:380]}"
                         })
             elif status == 200 and raw_bytes:
@@ -222,8 +223,13 @@ class ResourceConnectorEngine:
                 for entry in feed.entries[:8]:
                     s_soup = BeautifulSoup(entry.get("summary", ""), "html.parser")
                     summary = s_soup.get_text(" ", strip=True)
-                    full = f"{entry.get('title', '')}. {summary}"
-                    items.append({"author_id": entry.get("author", resource.name), "text": full[:480]})
+                    full = f"{entry.get('title', '')}. {summary}"[:480]
+                    # Уникальный отпечаток поста (копипаста получает один хеш, а разные статьи — разный!)
+                    post_sig = hashlib.md5(full[:80].encode("utf-8")).hexdigest()[:6]
+                    items.append({
+                        "author_id": entry.get("author") or f"{resource.name}#{post_sig}",
+                        "text": full
+                    })
 
         elif ctype == "html_scraper":
             status, raw_bytes = await cls.fetch_raw_capped(resource.url_or_id, use_304=True, proxy_url=proxy_url)
@@ -231,14 +237,15 @@ class ResourceConnectorEngine:
                 soup = BeautifulSoup(raw_bytes.decode("utf-8", errors="ignore"), "html.parser")
                 sel = cfg.get("item_selector", "article, .item, .news-item, .comment_text, p")
                 for el in soup.select(sel)[:8]:
-                    txt = el.get_text(" ", strip=True)
+                    txt = el.get_text(" ", strip=True)[:450]
                     if len(txt) > 45:
-                        items.append({"author_id": resource.name, "text": txt[:450]})
+                        post_sig = hashlib.md5(txt[:80].encode("utf-8")).hexdigest()[:6]
+                        items.append({"author_id": f"{resource.name}#{post_sig}", "text": txt})
 
-        if items:
+        if items and not search_query:
             cls._items_cache[resource.id] = (now, items)
 
         if search_query and items:
-            q_stem = search_query.lower()[:6]
+            q_stem = search_query.lower()[:5]
             return [i for i in items if q_stem in i["text"].lower()]
         return items
