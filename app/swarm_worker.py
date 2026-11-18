@@ -17,11 +17,13 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def format_24h_stats_line(delta_history: list[dict]) -> str:
-    """Формирует текстовую сводку встречаемости явления/мема/тренда по сайтам за последние 24 часа против прошлых суток"""
+def get_multi_site_note(delta_history: list[dict]) -> str:
+    """
+    Возвращает строчку статистики ТОЛЬКО если явление реально замечено на нескольких сайтах (>= 2 площадок)
+    или многократно подтверждено за сутки. Для обычных одиночных карточек возвращает пустую строку.
+    """
     now = utcnow()
     mentions_24h = 0
-    mentions_prev_24h = 0
     sites_24h = []
 
     for ev in (delta_history or []):
@@ -33,25 +35,15 @@ def format_24h_stats_line(delta_history: list[dict]) -> str:
         except Exception:
             ev_time = now
 
-        age_hours = max(0.0, (now - ev_time).total_seconds() / 3600.0)
-        src = ev.get("source") or ev.get("geo") or "Источник"
-        if age_hours <= 24.0:
+        if (now - ev_time).total_seconds() / 3600.0 <= 24.0:
             mentions_24h += 1
-            if src not in sites_24h:
-                sites_24h.append(src)
-        elif age_hours <= 48.0:
-            mentions_prev_24h += 1
-
-    if mentions_24h == 0 and delta_history:
-        mentions_24h = len(delta_history)
-        for ev in delta_history:
-            src = ev.get("source") or "Источник"
-            if src not in sites_24h:
+            src = ev.get("source") or ev.get("geo") or ""
+            if src and src not in sites_24h:
                 sites_24h.append(src)
 
-    sites_cnt = max(1, len(sites_24h))
-    sites_str = ", ".join(sites_24h[:5])
-    return f"📊 За последние 24 ч: встречен {mentions_24h} раз на {sites_cnt} сайтах (за прошлые сутки: {mentions_prev_24h} раз). Площадки: {sites_str}."
+    if len(sites_24h) >= 2 or mentions_24h >= 3:
+        return f"\n(Встречено {mentions_24h} раз на {len(sites_24h)} ресурсах за 24 ч: {', '.join(sites_24h[:5])})"
+    return ""
 
 
 async def update_agent_telemetry(
@@ -80,12 +72,6 @@ async def update_agent_telemetry(
 # 1. ПЧЕЛА-РАЗВЕДЧИЦА И РАБОЧАЯ ПЧЕЛА-ФУРАЖИР (SCOUT & FORAGER BEE)
 # =====================================================================
 class ScoutAndForagerBee:
-    """
-    Выполняет две полевые функции в Улье:
-    1) Как Пчела-Разведчица — облетает все 120 ресурсов сверху донизу (приоритет самым давно не проверенным).
-    2) Как Рабочая пчела (Фуражир) — летит по координатам сигнального танца на Доске проверять находку
-       на инвест-площадках, в патентах и в мейнстрим-СМИ.
-    """
     def __init__(self, agent_id: str, controller: "SwarmController"):
         self.agent_id = agent_id
         self.controller = controller
@@ -232,7 +218,6 @@ class ScoutAndForagerBee:
             combined_text = " \n ".join([i["text"] for i in items[:8]])
             authors = list({i.get("author_id", resource.name) for i in items[:8]})
 
-            # Хеш-предохранитель: если посты на странице не изменились — LLM не вызывается (0 токенов)
             content_hash = hashlib.md5(combined_text[:1500].encode("utf-8")).hexdigest()
             if resource.last_content_hash == content_hash:
                 resource.cooldown_until = utcnow() + timedelta(minutes=30)
@@ -243,17 +228,11 @@ class ScoutAndForagerBee:
                 return
             resource.last_content_hash = content_hash
 
-            has_visual_marker = any(
-                m in combined_text.lower()
-                for m in ("[медиафайл:", "[видеоролик", "формат: мем", "формат: видео", "[описание картинки", "[визуал:")
-            )
-            role = "vision_meme" if has_visual_marker else "dirty_scout"
-
             await update_agent_telemetry(
                 db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "ANALYZING", resource.name,
-                f"Анализ {len(items)} свежих записей ролью [{role}]...", inc_items=len(items)
+                f"Анализ {len(items)} свежих записей...", inc_items=len(items)
             )
-            analysis = await DynamicModelRouter.ask_agent(db, role, combined_text[:2500], raw_items=items[:8])
+            analysis = await DynamicModelRouter.ask_agent(db, "dirty_scout", combined_text[:2500], raw_items=items[:8])
 
             if analysis.get("is_anomaly", False):
                 resource.temperature = min(90.0, round(resource.temperature + 30.0, 1))
@@ -294,7 +273,7 @@ class ScoutAndForagerBee:
         authors: list[str] = None,
         is_mainstream: bool = False
     ):
-        """Передача находки Пчеле-Приёмщице: векторная склейка в pgvector и подсчет встречаемости за 24 часа"""
+        """Передача находки Пчеле-Приёмщице: векторная склейка дублей в pgvector и запись в Соты Памяти"""
         dist_col = TrendMemory.embedding.cosine_distance(signal.embedding).label("dist")
         stmt = select(TrendMemory, dist_col).order_by(dist_col).limit(1)
         row = (await db.execute(stmt)).first()
@@ -316,12 +295,10 @@ class ScoutAndForagerBee:
 
         if not existing:
             count_all = len((await db.execute(select(TrendMemory.id))).scalars().all())
-            deltas = [new_event]
-            stats_line = format_24h_stats_line(deltas)
             db.add(TrendMemory(
                 code=f"HIVE-{count_all + 1:04d}",
                 title=clean_title,
-                core_essence=f"{stats_line}\n{raw_essence}",
+                core_essence=raw_essence,
                 keywords_multilang=signal.search_queries,
                 embedding=signal.embedding,
                 origin_geo=geo,
@@ -331,7 +308,7 @@ class ScoutAndForagerBee:
                 acceleration_rate=0.0,
                 velocity=0.0,
                 z_score=0.0,
-                delta_history=deltas
+                delta_history=[new_event]
             ))
         else:
             if existing.lifecycle_status == "IGNORED_NOISE":
@@ -342,9 +319,10 @@ class ScoutAndForagerBee:
             hist.append(new_event)
             existing.delta_history = hist
 
-            stats_line = format_24h_stats_line(hist)
-            base_body = existing.core_essence.split("\n", 1)[-1] if "📊" in (existing.core_essence or "") else (existing.core_essence or raw_essence)
-            existing.core_essence = f"{stats_line}\n{base_body}"
+            # Добавляем пометку о кросс-сайтовой встречаемости только если тема реально пошла по разным ресурсам
+            note = get_multi_site_note(hist)
+            base_body = (existing.core_essence or raw_essence).split("\n(Встречено")[0]
+            existing.core_essence = f"{base_body}{note}"
 
             spread = set(existing.geo_spread or [])
             spread.add(geo)
@@ -466,9 +444,11 @@ class ReceiverMathBeeAgent:
                         tr.acceleration_rate = kpis.get("composite_acceleration", 0.0)
                         tr.last_analyzed_at = utcnow()
 
-                        stats_line = kpis.get("stats_24h_line") or format_24h_stats_line(deltas)
-                        base_body = tr.core_essence.split("\n", 1)[-1] if "📊" in (tr.core_essence or "") else (tr.core_essence or tr.title)
-                        tr.core_essence = f"{stats_line}\n{base_body}"
+                        note = get_multi_site_note(deltas)
+                        base_body = (tr.core_essence or tr.title).split("\n(Встречено")[0]
+                        if "📊" in base_body:
+                            base_body = base_body.split("\n", 1)[-1]
+                        tr.core_essence = f"{base_body}{note}"
 
                         if tr.is_in_mainstream_media:
                             tr.lifecycle_status = "MAINSTREAM_PRICED_IN"
