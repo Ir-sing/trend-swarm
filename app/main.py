@@ -61,7 +61,15 @@ async def scale_swarm_scouts(scout_count: int):
 
 @app.get("/api/memory/trends")
 async def get_trends(db: AsyncSession = Depends(get_db)):
-    return (await db.execute(select(TrendMemory).order_by(TrendMemory.acceleration_rate.desc(), TrendMemory.last_updated_at.desc()))).scalars().all()
+    rows = (await db.execute(select(TrendMemory).order_by(TrendMemory.acceleration_rate.desc(), TrendMemory.last_updated_at.desc()))).scalars().all()
+    return [{
+        "code": r.code, "title": r.title, "core_essence": r.core_essence,
+        "keywords_multilang": r.keywords_multilang, "lifecycle_status": r.lifecycle_status,
+        "origin_geo": r.origin_geo, "geo_spread": r.geo_spread,
+        "unique_authors_count": r.unique_authors_count, "velocity": r.velocity,
+        "z_score": r.z_score, "acceleration_rate": r.acceleration_rate,
+        "is_in_mainstream_media": r.is_in_mainstream_media, "delta_history": r.delta_history
+    } for r in rows]
 
 @app.get("/api/memory/meta-insights")
 async def get_meta_insights(db: AsyncSession = Depends(get_db)):
