@@ -118,7 +118,7 @@ docker-compose down
 ```text
 trend-swarm/
 ├── app/
-│   ├── main.py              # Точка входа FastAPI (предположительно)
+│   ├── main.py              # Точка входа FastAPI
 │   ├── swarm_worker.py      # Ядро: AutonomousScout, логика роя
 │   ├── database.py          # Асинхронное подключение к БД (AsyncSessionLocal)
 │   ├── models.py            # Модели SQLAlchemy (Resource, TrendMemory и др.)
