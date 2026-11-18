@@ -13,9 +13,9 @@ class ResourceConnectorEngine:
     _http_validators: dict[str, dict] = {}
     _items_cache: dict[int, tuple[float, list[dict]]] = {}
 
-    MAX_RESPONSE_BYTES = 180_000  # Жесткий лимит 180 КБ на страницу (экономия гигабайтов трафика)
-    CACHE_TTL_SECONDS = 1200      # 20 минут жизни локального кеша
-    MAX_CACHE_KEYS = 250          # Защита от утечки оперативной памяти при работе 24/7
+    MAX_RESPONSE_BYTES = 180_000
+    CACHE_TTL_SECONDS = 1500
+    MAX_CACHE_KEYS = 250
 
     @classmethod
     def get_client(cls, proxy_url: str = "") -> httpx.AsyncClient:
@@ -36,6 +36,29 @@ class ResourceConnectorEngine:
         return cls._client
 
     @classmethod
+    def search_block_cache(cls, resources: list[Resource], keywords: list[str]) -> list[tuple[Resource, list[dict]]]:
+        """
+        Мгновенный поиск совпадений сразу по ВСЕМ закешированным сайтам целевого блока (0 байт сетевого трафика!).
+        Проверяет вхождение корней ключевых слов (минимум 5 символов).
+        """
+        stems = [k.lower()[:6] for k in (keywords or []) if len(k.strip()) >= 4]
+        if not stems:
+            return []
+
+        hits = []
+        for res in resources:
+            if res.id not in cls._items_cache:
+                continue
+            _, cached_items = cls._items_cache[res.id]
+            matched_items = [
+                item for item in cached_items
+                if any(st in item.get("text", "").lower() for st in stems)
+            ]
+            if matched_items:
+                hits.append((res, matched_items))
+        return hits
+
+    @classmethod
     async def fetch_raw_capped(cls, url: str, params: dict = None, extra_headers: dict = None, use_304: bool = True, proxy_url: str = "") -> tuple[int, bytes]:
         if len(cls._http_validators) > cls.MAX_CACHE_KEYS:
             cls._http_validators.clear()
@@ -43,7 +66,7 @@ class ResourceConnectorEngine:
         client = cls.get_client(proxy_url)
         req_headers = dict(extra_headers or {})
         if "reddit.com" in url:
-            req_headers["User-Agent"] = "linux:trend.swarm.analytics:v2.4 (by /u/trend_research_bot)"
+            req_headers["User-Agent"] = "linux:trend.swarm.analytics:v2.5 (by /u/trend_research_bot)"
 
         cache_key = f"{url}?{json.dumps(params, sort_keys=True)}" if params else url
         if use_304 and cache_key in cls._http_validators:
@@ -85,13 +108,13 @@ class ResourceConnectorEngine:
         if len(cls._items_cache) > cls.MAX_CACHE_KEYS:
             cls._items_cache = {k: v for k, v in cls._items_cache.items() if (now - v[0]) < cls.CACHE_TTL_SECONDS}
 
-        # Если есть свежий локальный кеш — при перекрестной проверке (search_query) ищем строго реальные совпадения без скачивания сайта!
         if resource.id in cls._items_cache:
             cached_time, cached_items = cls._items_cache[resource.id]
             if (now - cached_time) < cls.CACHE_TTL_SECONDS:
                 if search_query:
-                    q_low = search_query.lower()
-                    return [i for i in cached_items if q_low in i["text"].lower()]
+                    q_stem = search_query.lower()[:6]
+                    # ИСПРАВЛЕНО: Возвращаем ТОЛЬКО реальные совпадения (никаких cached_items[:4] при отсутствии совпадений!)
+                    return [i for i in cached_items if q_stem in i["text"].lower()]
                 return cached_items
 
         proxy_cred = await cls.get_credentials(db, "proxies")
@@ -216,6 +239,6 @@ class ResourceConnectorEngine:
             cls._items_cache[resource.id] = (now, items)
 
         if search_query and items:
-            q_low = search_query.lower()
-            return [i for i in items if q_low in i["text"].lower()]
+            q_stem = search_query.lower()[:6]
+            return [i for i in items if q_stem in i["text"].lower()]
         return items
