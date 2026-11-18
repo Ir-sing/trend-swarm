@@ -7,16 +7,25 @@ from app.models import AgentRoleConfig, ConnectorCredential
 from app.math_engine import TrendMathEngine
 
 class DynamicModelRouter:
-    @staticmethod
-    async def ask_agent(db: AsyncSession, role_name: str, user_payload: str, image_url: str = None) -> dict:
+    @classmethod
+    async def ask_agent(cls, db: AsyncSession, role_name: str, user_payload: str, raw_items: list[dict] = None, image_url: str = None) -> dict:
         cfg = (await db.execute(select(AgentRoleConfig).where(AgentRoleConfig.role_name == role_name))).scalars().first()
         if not cfg:
             return {"is_anomaly": False}
 
         cred = (await db.execute(select(ConnectorCredential).where(ConnectorCredential.service_name == cfg.credential_service))).scalars().first()
-        api_key = (cred.api_key_or_token if cred and cred.api_key_or_token else None) or os.getenv("OPENROUTER_API_KEY")
+        token_or_url = cred.api_key_or_token.strip() if (cred and cred.api_key_or_token) else ""
 
-        if api_key or cfg.provider in ("ollama", "vllm"):
+        # Определяем параметры подключения (Локальная модель Ollama / vLLM без ключей ИЛИ внешний API, если указан)
+        api_base = cfg.api_base or os.getenv("LOCAL_LLM_URL")
+        api_key = None
+
+        if token_or_url.startswith("http://") or token_or_url.startswith("https://"):
+            api_base = token_or_url
+        elif token_or_url:
+            api_key = token_or_url
+
+        if cfg.provider in ("ollama", "vllm", "openai_compatible") or api_key or api_base:
             try:
                 messages = [{"role": "system", "content": cfg.system_prompt}]
                 if image_url:
@@ -24,36 +33,46 @@ class DynamicModelRouter:
                 else:
                     messages.append({"role": "user", "content": user_payload})
 
+                model_str = cfg.model_name
+                if cfg.provider not in model_str and cfg.provider in ("ollama", "openrouter", "openai"):
+                    model_str = f"{cfg.provider}/{cfg.model_name}"
+
                 kwargs = {
-                    "model": f"{cfg.provider}/{cfg.model_name}" if cfg.provider not in cfg.model_name else cfg.model_name,
+                    "model": model_str,
                     "messages": messages,
                     "temperature": cfg.temperature,
-                    "response_format": {"type": "json_object"}
+                    "response_format": {"type": "json_object"},
+                    "timeout": 25.0
                 }
-                if cfg.api_base:
-                    kwargs["api_base"] = cfg.api_base
+                if api_base:
+                    kwargs["api_base"] = api_base
+                elif cfg.provider == "ollama":
+                    kwargs["api_base"] = "http://host.docker.internal:11434"
                 if api_key:
                     kwargs["api_key"] = api_key
 
                 resp = await acompletion(**kwargs)
                 return json.loads(resp.choices[0].message.content)
             except Exception as e:
-                print(f"⚠️ LLM fallback ({cfg.model_name}): {e}")
+                # Если локальный сервер Ollama еще не поднят — не падаем и не лепим фейковые обертки,
+                # а передаем управление чистому математическому экстрактору фактов:
+                pass
 
-        text_lower = user_payload.lower()
-        triggers = ["клетчатк", "fiber", "протеин", "protein", "завод", "инвест", "фермент", "gut", "новинк", "состав", "технолог", "рецептур", "дефицит", "сахар", "prebiotic", "glp"]
-        matched = [t for t in triggers if t in text_lower]
-        if matched:
-            return {
-                "is_anomaly": True,
-                "confirmed": True,
-                "title": f"Сигнал [{', '.join(matched[:3])}]",
-                "essence": f"Зафиксирован всплеск по маркерам ({', '.join(matched)}): {user_payload[:260]}...",
-                "core_essence": f"Сдвиг спроса/инвестиций по маркерам ({', '.join(matched)}): {user_payload[:320]}",
-                "delta_summary": f"Новое подтверждение ({', '.join(matched)}).",
-                "summary": user_payload[:220],
-                "multilang_keywords": matched[:4]
-            }
+        # Чистая математическая выжимка факта (без фальшивых фраз "Сигнал [...]", "Сдвиг спроса..." и без обрывков!)
+        if raw_items:
+            extracted = TrendMathEngine.extract_clean_facts_and_terms(raw_items)
+            if extracted.get("has_signal"):
+                return {
+                    "is_anomaly": True,
+                    "confirmed": True,
+                    "title": extracted["title"],
+                    "essence": extracted["essence"],
+                    "core_essence": extracted["essence"],
+                    "delta_summary": extracted["essence"],
+                    "summary": extracted["essence"],
+                    "multilang_keywords": extracted["keywords"]
+                }
+
         return {"is_anomaly": False, "confirmed": False}
 
     @staticmethod
