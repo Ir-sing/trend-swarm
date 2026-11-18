@@ -4,15 +4,65 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, or_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal
-from app.models import Resource, SemanticBlock, SwarmBlackboard, TrendMemory, AgentTelemetry, MetaInsight
+from app.models import (
+    Resource, SemanticBlock, SwarmBlackboard, 
+    TrendMemory, AgentTelemetry, MetaInsight
+)
 from app.connectors import ResourceConnectorEngine
 from app.llm_router import DynamicModelRouter
 from app.math_engine import TrendMathEngine
 
-def utcnow():
+
+def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-async def update_agent_telemetry(db: AsyncSession, agent_id: str, agent_type: str, state: str, resource_name: str, action: str, inc_items: int = 0):
+
+def format_24h_stats_line(delta_history: list[dict]) -> str:
+    """Формирует текстовую сводку встречаемости явления/мема/тренда по сайтам за последние 24 часа против прошлых суток"""
+    now = utcnow()
+    mentions_24h = 0
+    mentions_prev_24h = 0
+    sites_24h = []
+
+    for ev in (delta_history or []):
+        ts_str = ev.get("timestamp")
+        try:
+            ev_time = datetime.fromisoformat(ts_str) if ts_str else now
+            if ev_time.tzinfo is None:
+                ev_time = ev_time.replace(tzinfo=timezone.utc)
+        except Exception:
+            ev_time = now
+
+        age_hours = max(0.0, (now - ev_time).total_seconds() / 3600.0)
+        src = ev.get("source") or ev.get("geo") or "Источник"
+        if age_hours <= 24.0:
+            mentions_24h += 1
+            if src not in sites_24h:
+                sites_24h.append(src)
+        elif age_hours <= 48.0:
+            mentions_prev_24h += 1
+
+    if mentions_24h == 0 and delta_history:
+        mentions_24h = len(delta_history)
+        for ev in delta_history:
+            src = ev.get("source") or "Источник"
+            if src not in sites_24h:
+                sites_24h.append(src)
+
+    sites_cnt = max(1, len(sites_24h))
+    sites_str = ", ".join(sites_24h[:5])
+    return f"📊 За последние 24 ч: встречен {mentions_24h} раз на {sites_cnt} сайтах (за прошлые сутки: {mentions_prev_24h} раз). Площадки: {sites_str}."
+
+
+async def update_agent_telemetry(
+    db: AsyncSession,
+    agent_id: str,
+    agent_type: str,
+    state: str,
+    resource_name: str,
+    action: str,
+    inc_items: int = 0
+):
     tel = (await db.execute(select(AgentTelemetry).where(AgentTelemetry.agent_id == agent_id))).scalars().first()
     if not tel:
         tel = AgentTelemetry(agent_id=agent_id, agent_type=agent_type, items_processed=0)
@@ -25,8 +75,17 @@ async def update_agent_telemetry(db: AsyncSession, agent_id: str, agent_type: st
     tel.updated_at = utcnow()
     await db.commit()
 
+
+# =====================================================================
+# 1. ПЧЕЛА-РАЗВЕДЧИЦА И РАБОЧАЯ ПЧЕЛА-ФУРАЖИР (SCOUT & FORAGER BEE)
+# =====================================================================
 class ScoutAndForagerBee:
-    """Выполняет роль Пчелы-Разведчицы (поиск нового) и Рабочей Пчелы-Фуражира (проверка координат танца на инвест-площадках и в СМИ)"""
+    """
+    Выполняет две полевые функции в Улье:
+    1) Как Пчела-Разведчица — облетает все 120 ресурсов сверху донизу (приоритет самым давно не проверенным).
+    2) Как Рабочая пчела (Фуражир) — летит по координатам сигнального танца на Доске проверять находку
+       на инвест-площадках, в патентах и в мейнстрим-СМИ.
+    """
     def __init__(self, agent_id: str, controller: "SwarmController"):
         self.agent_id = agent_id
         self.controller = controller
@@ -42,26 +101,35 @@ class ScoutAndForagerBee:
                 break
             except Exception as e:
                 async with AsyncSessionLocal() as db:
-                    await update_agent_telemetry(db, self.agent_id, "РАЗВЕДЧИЦА / ФУРАЖИР", "ERROR", "-", f"Помеха: {str(e)[:90]}")
+                    await update_agent_telemetry(
+                        db, self.agent_id, "РАЗВЕДЧИЦА / ФУРАЖИР", "ERROR", "-", f"Помеха на линии: {str(e)[:90]}"
+                    )
             await asyncio.sleep(6)
 
         async with AsyncSessionLocal() as db:
-            await update_agent_telemetry(db, self.agent_id, "РАЗВЕДЧИЦА / ФУРАЖИР", "STOPPED", "-", "В улье (Пауза)")
+            await update_agent_telemetry(db, self.agent_id, "РАЗВЕДЧИЦА / ФУРАЖИР", "STOPPED", "-", "В улье (На паузе)")
 
     async def forage_by_waggle_dance(self, db: AsyncSession) -> bool:
-        """Режим Рабочей Пчелы (Фуражира): летит по координатам танца проверять сигнал в блоках Инвестиций, Патентов и СМИ"""
+        """Режим Рабочей пчелы (Фуражира): перекрестная проверка сигнала в смежных смысловых блоках"""
         stmt = select(SwarmBlackboard).where(SwarmBlackboard.status == "ACTIVE").order_by(SwarmBlackboard.priority_boost.desc())
         signals = (await db.execute(stmt)).scalars().all()
+
         for signal in signals:
             unchecked = [b for b in signal.target_block_types if b not in signal.checked_by_blocks]
             if not unchecked:
                 signal.status = "PROMOTED_TO_MEMORY"
                 await db.commit()
                 continue
+
             target_block = unchecked[0]
             res_stmt = (
-                select(Resource).join(SemanticBlock)
-                .where(SemanticBlock.block_type == target_block, Resource.is_active == True, Resource.locked_by_agent == None)
+                select(Resource)
+                .join(SemanticBlock)
+                .where(
+                    SemanticBlock.block_type == target_block,
+                    Resource.is_active == True,
+                    Resource.locked_by_agent == None
+                )
                 .order_by(Resource.last_crawled_at.asc().nullsfirst(), Resource.temperature.desc())
                 .with_for_update(skip_locked=True)
                 .limit(1)
@@ -76,20 +144,33 @@ class ScoutAndForagerBee:
 
             try:
                 q = signal.search_queries[0] if signal.search_queries else ""
-                await update_agent_telemetry(db, self.agent_id, "РАБОЧАЯ ПЧЕЛА (ФУРАЖИР)", "FORAGING", resource.name, f"Проверка по танцу разведчицы '{signal.signal_summary[:40]}...' в [{target_block}]")
+                await update_agent_telemetry(
+                    db, self.agent_id, "РАБОЧАЯ ПЧЕЛА (ФУРАЖИР)", "FORAGING", resource.name,
+                    f"Проверка танца разведчицы '{signal.signal_summary[:40]}...' в блоке [{target_block}]"
+                )
                 items = await ResourceConnectorEngine.fetch(db, resource, search_query=q)
                 checked = list(signal.checked_by_blocks)
                 checked.append(target_block)
                 signal.checked_by_blocks = checked
+
                 if items:
                     sample_text = " . ".join([i["text"][:220] for i in items[:4]])
                     authors = list({i.get("author_id", resource.name) for i in items[:4]})
                     analysis = await DynamicModelRouter.ask_agent(db, "dirty_scout", sample_text, raw_items=items[:4])
                     if analysis.get("confirmed", False):
                         conf = list(signal.confirmations)
-                        conf.append({"block": target_block, "resource": resource.name, "geo": resource.geo_region, "details": analysis.get("summary", sample_text[:180])})
+                        conf.append({
+                            "block": target_block,
+                            "resource": resource.name,
+                            "geo": resource.geo_region,
+                            "details": analysis.get("summary", sample_text[:180])
+                        })
                         signal.confirmations = conf
-                        await self.hand_over_to_receiver_bee(db, signal, resource.geo_region, analysis=analysis, authors=authors, is_mainstream=(target_block == "mainstream_media"))
+                        await self.hand_over_to_receiver_bee(
+                            db, signal, resource.geo_region,
+                            analysis=analysis, authors=authors,
+                            is_mainstream=(target_block == "mainstream_media")
+                        )
             except Exception as err:
                 resource.fail_count = (resource.fail_count or 0) + 1
                 resource.last_error = str(err)[:200]
@@ -101,18 +182,25 @@ class ScoutAndForagerBee:
         return False
 
     async def scout_flowers(self, db: AsyncSession):
-        """Режим Пчелы-Разведчицы: облетает все 120 ресурсов сверху донизу (приоритет тем, где дольше не были)"""
+        """Режим Пчелы-Разведчицы: равномерный облет всех 120 URL от самых давно не проверенных к свежим"""
         now = utcnow()
         stmt = (
             select(Resource)
-            .where(Resource.is_active == True, Resource.locked_by_agent == None, or_(Resource.cooldown_until == None, Resource.cooldown_until < now))
+            .where(
+                Resource.is_active == True,
+                Resource.locked_by_agent == None,
+                or_(Resource.cooldown_until == None, Resource.cooldown_until < now)
+            )
             .order_by(Resource.last_crawled_at.asc().nullsfirst(), Resource.temperature.desc())
             .with_for_update(skip_locked=True)
             .limit(1)
         )
         resource = (await db.execute(stmt)).scalars().first()
         if not resource:
-            await update_agent_telemetry(db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", "В улье", "Все 120 источников обследованы, ожидание новых публикаций...")
+            await update_agent_telemetry(
+                db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", "В улье",
+                "Все 120 ресурсов обследованы, ожидание новых публикаций..."
+            )
             await asyncio.sleep(10)
             return
 
@@ -122,38 +210,57 @@ class ScoutAndForagerBee:
 
         try:
             tags_str = ", ".join(resource.tags or [])
-            await update_agent_telemetry(db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "SCOUTING", resource.name, f"Сбор нектара [{resource.connector_type}] ({resource.geo_region}) {tags_str}")
+            await update_agent_telemetry(
+                db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "SCOUTING", resource.name,
+                f"Сбор данных [{resource.connector_type}] ({resource.geo_region}) {tags_str}"
+            )
             items = await ResourceConnectorEngine.fetch(db, resource)
             resource.last_crawled_at = utcnow()
             resource.fail_count = 0
             resource.health_status = "HEALTHY"
-            # После сбора нектара цветок остывает на -25°, пропуская вперед нижние ресурсы списка!
+            # После визита пчелы цветок остывает на -25°, пропуская вперед нижние ресурсы списка
             resource.temperature = max(25.0, round(resource.temperature - 25.0, 1))
 
             if not items:
                 resource.cooldown_until = utcnow() + timedelta(minutes=25)
-                await update_agent_telemetry(db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", resource.name, "Новых записей нет (Пауза 25 мин)")
+                await update_agent_telemetry(
+                    db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", resource.name,
+                    "Новых записей нет (Пауза 25 мин / 0 токенов)"
+                )
                 return
 
             combined_text = " \n ".join([i["text"] for i in items[:8]])
             authors = list({i.get("author_id", resource.name) for i in items[:8]})
+
+            # Хеш-предохранитель: если посты на странице не изменились — LLM не вызывается (0 токенов)
             content_hash = hashlib.md5(combined_text[:1500].encode("utf-8")).hexdigest()
             if resource.last_content_hash == content_hash:
                 resource.cooldown_until = utcnow() + timedelta(minutes=30)
-                await update_agent_telemetry(db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", resource.name, "Контент без изменений")
+                await update_agent_telemetry(
+                    db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", resource.name,
+                    "Контент без изменений — пропуск LLM (0 токенов)"
+                )
                 return
             resource.last_content_hash = content_hash
 
-            first_img = next((i["image_url"] for i in items if i.get("image_url")), None)
-            role = "vision_meme" if first_img else "dirty_scout"
+            has_visual_marker = any(
+                m in combined_text.lower()
+                for m in ("[медиафайл:", "[видеоролик", "формат: мем", "формат: видео", "[описание картинки", "[визуал:")
+            )
+            role = "vision_meme" if has_visual_marker else "dirty_scout"
 
-            await update_agent_telemetry(db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "ANALYZING", resource.name, f"Анализ {len(items)} свежих записей...", inc_items=len(items))
-            analysis = await DynamicModelRouter.ask_agent(db, role, combined_text[:2500], raw_items=items[:8], image_url=first_img)
+            await update_agent_telemetry(
+                db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "ANALYZING", resource.name,
+                f"Анализ {len(items)} свежих записей ролью [{role}]...", inc_items=len(items)
+            )
+            analysis = await DynamicModelRouter.ask_agent(db, role, combined_text[:2500], raw_items=items[:8])
 
             if analysis.get("is_anomaly", False):
                 resource.temperature = min(90.0, round(resource.temperature + 30.0, 1))
                 resource.cooldown_until = utcnow() + timedelta(minutes=20)
-                vec = DynamicModelRouter.compute_fast_vector(analysis.get("title", "") + " " + analysis.get("essence", ""))
+                vec = DynamicModelRouter.compute_fast_vector(
+                    analysis.get("title", "") + " " + analysis.get("essence", "")
+                )
                 new_sig = SwarmBlackboard(
                     source_resource_name=resource.name,
                     signal_summary=analysis.get("essence", ""),
@@ -163,7 +270,10 @@ class ScoutAndForagerBee:
                 )
                 db.add(new_sig)
                 await db.flush()
-                await self.hand_over_to_receiver_bee(db, new_sig, resource.geo_region, analysis=analysis, authors=authors, is_mainstream=False)
+                await self.hand_over_to_receiver_bee(
+                    db, new_sig, resource.geo_region,
+                    analysis=analysis, authors=authors, is_mainstream=False
+                )
             else:
                 resource.cooldown_until = utcnow() + timedelta(minutes=30)
         except Exception as err:
@@ -175,8 +285,16 @@ class ScoutAndForagerBee:
             resource.locked_by_agent = None
             await db.commit()
 
-    async def hand_over_to_receiver_bee(self, db: AsyncSession, signal: SwarmBlackboard, geo: str, analysis: dict = None, authors: list[str] = None, is_mainstream: bool = False):
-        """Передача находки Пчеле-Приёмщице: векторная проверка дублей в pgvector и запись в Соты Памяти"""
+    async def hand_over_to_receiver_bee(
+        self,
+        db: AsyncSession,
+        signal: SwarmBlackboard,
+        geo: str,
+        analysis: dict = None,
+        authors: list[str] = None,
+        is_mainstream: bool = False
+    ):
+        """Передача находки Пчеле-Приёмщице: векторная склейка в pgvector и подсчет встречаемости за 24 часа"""
         dist_col = TrendMemory.embedding.cosine_distance(signal.embedding).label("dist")
         stmt = select(TrendMemory, dist_col).order_by(dist_col).limit(1)
         row = (await db.execute(stmt)).first()
@@ -184,15 +302,26 @@ class ScoutAndForagerBee:
 
         now_iso = utcnow().isoformat()
         primary_author = authors[0] if authors else signal.source_resource_name
-        clean_title = (analysis or {}).get("title") or signal.signal_summary[:85]
-        clean_core = (analysis or {}).get("core_essence") or signal.signal_summary
+        clean_title = (analysis or {}).get("title") or signal.signal_summary[:90]
+        raw_essence = (analysis or {}).get("core_essence") or signal.signal_summary
+
+        new_event = {
+            "timestamp": now_iso,
+            "date": utcnow().strftime("%Y-%m-%d %H:%M"),
+            "source": signal.source_resource_name,
+            "author": primary_author,
+            "geo": geo,
+            "event": signal.signal_summary
+        }
 
         if not existing:
             count_all = len((await db.execute(select(TrendMemory.id))).scalars().all())
+            deltas = [new_event]
+            stats_line = format_24h_stats_line(deltas)
             db.add(TrendMemory(
                 code=f"HIVE-{count_all + 1:04d}",
                 title=clean_title,
-                core_essence=clean_core,
+                core_essence=f"{stats_line}\n{raw_essence}",
                 keywords_multilang=signal.search_queries,
                 embedding=signal.embedding,
                 origin_geo=geo,
@@ -202,30 +331,21 @@ class ScoutAndForagerBee:
                 acceleration_rate=0.0,
                 velocity=0.0,
                 z_score=0.0,
-                delta_history=[{
-                    "timestamp": now_iso,
-                    "date": utcnow().strftime("%Y-%m-%d %H:%M"),
-                    "source": signal.source_resource_name,
-                    "author": primary_author,
-                    "geo": geo,
-                    "event": signal.signal_summary
-                }]
+                delta_history=deltas
             ))
         else:
             if existing.lifecycle_status == "IGNORED_NOISE":
                 return
             hist = list(existing.delta_history or [])
-            if any(d.get("event") == signal.signal_summary for d in hist):
+            if any(d.get("event") == signal.signal_summary and d.get("source") == signal.source_resource_name for d in hist):
                 return
-            hist.append({
-                "timestamp": now_iso,
-                "date": utcnow().strftime("%Y-%m-%d %H:%M"),
-                "source": signal.source_resource_name,
-                "author": primary_author,
-                "geo": geo,
-                "event": signal.signal_summary
-            })
+            hist.append(new_event)
             existing.delta_history = hist
+
+            stats_line = format_24h_stats_line(hist)
+            base_body = existing.core_essence.split("\n", 1)[-1] if "📊" in (existing.core_essence or "") else (existing.core_essence or raw_essence)
+            existing.core_essence = f"{stats_line}\n{base_body}"
+
             spread = set(existing.geo_spread or [])
             spread.add(geo)
             existing.geo_spread = list(spread)
@@ -237,8 +357,11 @@ class ScoutAndForagerBee:
                 existing.lifecycle_status = "MAINSTREAM_PRICED_IN"
         await db.commit()
 
+
+# =====================================================================
+# 2. ПЧЕЛИНАЯ КОРОЛЕВА (QUEEN BEE — БАЛАНС УЛЬЯ И ПРОГРЕВ НИЖНИХ РЕСУРСОВ)
+# =====================================================================
 class QueenBeeAgent:
-    """Пчелиная Королева: следит за балансом облета всех 6 блоков и подогревает нижние холодные ресурсы"""
     def __init__(self, controller: "SwarmController"):
         self.agent_id = "Пчелиная Королева"
         self.controller = controller
@@ -254,9 +377,14 @@ class QueenBeeAgent:
                             r.temperature = round(r.temperature + 12.0, 1)
                             warmed_up += 1
                     active_sigs = (await db.execute(select(SwarmBlackboard).where(SwarmBlackboard.status == "ACTIVE"))).scalars().all()
+                    for sig in active_sigs:
+                        sig.priority_boost = round((sig.priority_boost or 1.0) + 0.5, 1)
+
                     await update_agent_telemetry(
-                        db, self.agent_id, "КОРОЛЕВА", "ORCHESTRATING", f"Поле из {len(all_res)} URL (Пчёл: {self.controller.scout_count})",
-                        f"Подогрето нижних холодных ресурсов: {warmed_up} шт. | Активных танцев на Доске: {len(active_sigs)}", inc_items=1
+                        db, self.agent_id, "КОРОЛЕВА", "ORCHESTRATING",
+                        f"Поле из {len(all_res)} URL (Пчёл: {self.controller.scout_count})",
+                        f"Подогрето нижних холодных ресурсов: {warmed_up} шт. | Активных танцев на Доске: {len(active_sigs)}",
+                        inc_items=1
                     )
             except asyncio.CancelledError:
                 break
@@ -264,8 +392,11 @@ class QueenBeeAgent:
                 print(f"⚠️ QueenBee error: {e}")
             await asyncio.sleep(40)
 
+
+# =====================================================================
+# 3. ПЧЕЛА-СТРАЖ (GUARD BEE — ИММУНИТЕТ УЛЬЯ, ЧИСТКА ЛОКОВ И КОННЕКТОРОВ)
+# =====================================================================
 class GuardBeeAgent:
-    """Пчела-Страж: охраняет леток от сбоев, снимает зомби-локи и контролирует живучесть роя"""
     def __init__(self, controller: "SwarmController"):
         self.agent_id = "Пчела-Страж"
         self.controller = controller
@@ -284,11 +415,18 @@ class GuardBeeAgent:
                             r.health_status, r.fail_count = "REANIMATING", 0
                             r.cooldown_until = now + timedelta(minutes=20)
                             healed += 1
-                    await db.execute(delete(SwarmBlackboard).where(SwarmBlackboard.status == "PROMOTED_TO_MEMORY", SwarmBlackboard.created_at < (now - timedelta(hours=6))))
+
+                    await db.execute(
+                        delete(SwarmBlackboard).where(
+                            SwarmBlackboard.status == "PROMOTED_TO_MEMORY",
+                            SwarmBlackboard.created_at < (now - timedelta(hours=6))
+                        )
+                    )
                     revived = await self.controller.ensure_scouts_alive()
                     await update_agent_telemetry(
                         db, self.agent_id, "СТРАЖ", "GUARDING", "Леток Улья & Сеть",
-                        f"Снято зависших локов: {locks} | Восстановлено URL: {healed} | В строю разведчиц: {self.controller.scout_count}", inc_items=locks+healed+revived
+                        f"Снято зависших локов: {locks} | Восстановлено URL: {healed} | В строю разведчиц: {self.controller.scout_count}",
+                        inc_items=locks + healed + revived
                     )
             except asyncio.CancelledError:
                 break
@@ -296,12 +434,11 @@ class GuardBeeAgent:
                 print(f"⚠️ GuardBee error: {e}")
             await asyncio.sleep(45)
 
+
+# =====================================================================
+# 4. ПЧЕЛА-ПРИЁМЩИЦА (RECEIVER BEE — МАТЕМАТИКА БАЗЫ, Z-SCORE И RAG-ЗАВИСИМОСТИ)
+# =====================================================================
 class ReceiverMathBeeAgent:
-    """
-    Пчела-Приёмщица (Математика & RAG-зависимости):
-    1) Пересчитывает Z-Score, Скорость и Ускорение относительно Базового замера (TrendMathEngine).
-    2) Находит семантические пересечения между РАЗНЫМИ трендами в pgvector (исправляет проблему застревания на 2 записях!).
-    """
     def __init__(self, controller: "SwarmController"):
         self.agent_id = "Пчела-Приёмщица (Математика)"
         self.controller = controller
@@ -312,7 +449,10 @@ class ReceiverMathBeeAgent:
                 async with AsyncSessionLocal() as db:
                     trends = (await db.execute(select(TrendMemory).where(TrendMemory.lifecycle_status != "IGNORED_NOISE"))).scalars().all()
                     if not trends:
-                        await update_agent_telemetry(db, self.agent_id, "ПРИЁМЩИЦА", "IDLE", "Соты Памяти (0)", "Ожидание первых полевых находок...")
+                        await update_agent_telemetry(
+                            db, self.agent_id, "ПРИЁМЩИЦА", "IDLE", "Соты Памяти (0)",
+                            "Ожидание первых полевых находок от разведчиц..."
+                        )
                         await asyncio.sleep(20)
                         continue
 
@@ -320,11 +460,15 @@ class ReceiverMathBeeAgent:
                     for tr in trends:
                         deltas = tr.delta_history or []
                         kpis = TrendMathEngine.calculate_kpis(deltas)
-                        tr.velocity = kpis["velocity"]
-                        tr.z_score = kpis["z_score"]
-                        tr.unique_authors_count = kpis["unique_authors"]
-                        tr.acceleration_rate = kpis["composite_acceleration"]
+                        tr.velocity = kpis.get("velocity", 0.0)
+                        tr.z_score = kpis.get("z_score", 0.0)
+                        tr.unique_authors_count = kpis.get("unique_authors", 1)
+                        tr.acceleration_rate = kpis.get("composite_acceleration", 0.0)
                         tr.last_analyzed_at = utcnow()
+
+                        stats_line = kpis.get("stats_24h_line") or format_24h_stats_line(deltas)
+                        base_body = tr.core_essence.split("\n", 1)[-1] if "📊" in (tr.core_essence or "") else (tr.core_essence or tr.title)
+                        tr.core_essence = f"{stats_line}\n{base_body}"
 
                         if tr.is_in_mainstream_media:
                             tr.lifecycle_status = "MAINSTREAM_PRICED_IN"
@@ -335,13 +479,12 @@ class ReceiverMathBeeAgent:
                             tr.lifecycle_status = "CALIBRATING_BASELINE"
                     await db.commit()
 
-                    # RAG-ПОИСК НОВЫХ ЗАВИСИМОСТЕЙ ПО ВСЕМ СОТАМ ПАМЯТИ:
-                    # Ищем пары трендов из разных источников с пересекающимися ключами или близкими векторами, которые еще не связаны в MetaInsight!
+                    # RAG-поиск новых зависимостей между разными трендами в Сотах Памяти
                     existing_metas = (await db.execute(select(MetaInsight))).scalars().all()
                     already_paired = {tuple(sorted(m.linked_trend_codes or [])) for m in existing_metas}
 
                     new_pairs_found = 0
-                    recent_trends = sorted(trends, key=lambda x: (x.acceleration_rate, x.id), reverse=True)[:50]
+                    recent_trends = sorted(trends, key=lambda x: (x.acceleration_rate, x.id), reverse=True)[:60]
                     for i in range(len(recent_trends)):
                         t1 = recent_trends[i]
                         kw1 = set(t1.keywords_multilang or [])
@@ -361,8 +504,11 @@ class ReceiverMathBeeAgent:
                                     title=f"Кросс-зависимость по маркеру [{shared_str}] ({t1.code} + {t2.code})",
                                     linked_trend_codes=list(pair_key),
                                     pattern_type="CROSS_CHANNEL_RAG",
-                                    consumer_pain_summary=f"1) [{src1}]: {t1.core_essence[:220]}\n2) [{src2}]: {t2.core_essence[:220]}",
-                                    investment_or_product_thesis=f"Общее семантическое ядро ({shared_str}) зафиксировано независимо в источниках: {src1} и {src2}. Рекомендуется проверка через RAG-шлюз Гермеса (/api/hermes/search?q={list(common_kw)[0]}).",
+                                    consumer_pain_summary=f"1) [{src1}]: {t1.title}\n2) [{src2}]: {t2.title}",
+                                    investment_or_product_thesis=(
+                                        f"Явление [{shared_str}] независимо зафиксировано в разных каналах ({src1} и {src2}). "
+                                        f"Доступно для детального запроса через RAG-шлюз Гермеса: /api/hermes/search?q={list(common_kw)[0]}"
+                                    ),
                                     confidence_score=0.85
                                 ))
                                 new_pairs_found += 1
@@ -375,7 +521,7 @@ class ReceiverMathBeeAgent:
 
                     await update_agent_telemetry(
                         db, self.agent_id, "ПРИЁМЩИЦА", "IDLE", f"Соты Памяти ({len(trends)} трендов)",
-                        f"Ускоряются к базе: {accelerating_cnt} | На замере базы: {len(trends) - accelerating_cnt} | Новых RAG-зависимостей: +{new_pairs_found}",
+                        f"Ускоряются к базе: {accelerating_cnt} | На замере базы: {len(trends) - accelerating_cnt} | Новых RAG-связок: +{new_pairs_found}",
                         inc_items=new_pairs_found
                     )
             except asyncio.CancelledError:
@@ -384,6 +530,10 @@ class ReceiverMathBeeAgent:
                 print(f"⚠️ ReceiverMathBee error: {e}")
             await asyncio.sleep(25)
 
+
+# =====================================================================
+# КОНТРОЛЛЕР УЛЬЯ (ДИНАМИЧЕСКОЕ МАСШТАБИРОВАНИЕ 1..100 РАЗВЕДЧИЦ)
+# =====================================================================
 class SwarmController:
     def __init__(self):
         self.is_running = False
@@ -457,5 +607,6 @@ class SwarmController:
                 tel.state = "STOPPED"
                 tel.current_action = "В улье (Остановлена)"
             await db.commit()
+
 
 swarm_controller = SwarmController()
