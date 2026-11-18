@@ -64,9 +64,6 @@ async def update_agent_telemetry(
     await db.commit()
 
 
-# =====================================================================
-# 1. ПЧЕЛА-РАЗВЕДЧИЦА И РАБОЧАЯ ПЧЕЛА-ФУРАЖИР (SCOUT & FORAGER BEE)
-# =====================================================================
 class ScoutAndForagerBee:
     def __init__(self, agent_id: str, controller: "SwarmController"):
         self.agent_id = agent_id
@@ -95,8 +92,7 @@ class ScoutAndForagerBee:
         """
         Режим Рабочей пчелы (Фуражира):
         Проверяет ключевые корни сигнала сразу по ВСЕМ закешированным сайтам целевого блока
-        (investments, b2b_patents, mainstream_media) за 0 байт сетевого трафика.
-        Никаких случайных подстановок: подтверждение засчитывается строго при реальном совпадении!
+        (investments, b2b_patents, mainstream_media) за 0 байт трафика и 0 токенов!
         """
         stmt = (
             select(SwarmBlackboard)
@@ -160,10 +156,11 @@ class ScoutAndForagerBee:
         return True
 
     async def scout_flowers(self, db: AsyncSession):
-        """Режим Пчелы-Разведчицы: равномерный облет всех 120 URL от самых давно не проверенных к свежим"""
+        """Режим Пчелы-Разведчицы: равномерный облет всех 120 URL. Мейнстрим-СМИ используются строго как Kill-Switch!"""
         now = utcnow()
         stmt = (
-            select(Resource)
+            select(Resource, SemanticBlock.block_type)
+            .join(SemanticBlock)
             .where(
                 Resource.is_active == True,
                 Resource.locked_by_agent == None,
@@ -173,15 +170,16 @@ class ScoutAndForagerBee:
             .with_for_update(skip_locked=True)
             .limit(1)
         )
-        resource = (await db.execute(stmt)).scalars().first()
-        if not resource:
+        row = (await db.execute(stmt)).first()
+        if not row:
             await update_agent_telemetry(
                 db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "IDLE", "В улье",
-                "Все 120 ресурсов обследованы, режим бережной экономии трафика..."
+                "Все 120 ресурсов проверены, режим экономии трафика и токенов..."
             )
             await asyncio.sleep(15)
             return
 
+        resource, block_type = row[0], row[1]
         resource.locked_by_agent = self.agent_id
         resource.locked_at = now
         await db.commit()
@@ -206,6 +204,29 @@ class ScoutAndForagerBee:
                 )
                 return
 
+            # ВАЖНО: Если это Блок №6 (Мейнстрим-СМИ: РБК, Ведомости, Forbes, ТАСС, Lenta) —
+            # мы НЕ ищем в газетах новые тренды и НЕ тратим на них токены LLM!
+            # Мы только проверяем, не попали ли уже найденные нами тренды в заголовки этих газет (Kill-Switch)!
+            if block_type == "mainstream_media":
+                media_blob = " ".join([i["text"].lower() for i in items])
+                active_trends = (
+                    await db.execute(select(TrendMemory).where(TrendMemory.is_in_mainstream_media == False))
+                ).scalars().all()
+                flagged = 0
+                for tr in active_trends:
+                    stems = [k.lower()[:6] for k in (tr.keywords_multilang or []) if len(k) >= 4]
+                    if len(stems) >= 2 and sum(1 for s in stems if s in media_blob) >= 2:
+                        tr.is_in_mainstream_media = True
+                        tr.lifecycle_status = "MAINSTREAM_PRICED_IN"
+                        flagged += 1
+                resource.cooldown_until = utcnow() + timedelta(minutes=45)
+                await update_agent_telemetry(
+                    db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "CALIBRATING", resource.name,
+                    f"Калибровка по СМИ (0 токенов): отсечено вышедших в тираж трендов: {flagged}",
+                    inc_items=len(items)
+                )
+                return
+
             combined_text = " \n ".join([i["text"] for i in items[:6]])
             authors = list({i.get("author_id", resource.name) for i in items[:6]})
 
@@ -221,9 +242,11 @@ class ScoutAndForagerBee:
 
             await update_agent_telemetry(
                 db, self.agent_id, "ПЧЕЛА-РАЗВЕДЧИЦА", "ANALYZING", resource.name,
-                f"Проверка {len(items)} новых записей через мат. фильтр IDF и модель...", inc_items=len(items)
+                f"Проверка {len(items)} записей через матрицу зарождения трендов...", inc_items=len(items)
             )
-            analysis = await DynamicModelRouter.ask_agent(db, "dirty_scout", combined_text[:700], raw_items=items[:6])
+            analysis = await DynamicModelRouter.ask_agent(
+                db, "dirty_scout", combined_text[:650], raw_items=items[:6], source_name=resource.name
+            )
 
             if analysis.get("is_anomaly", False) and analysis.get("multilang_keywords"):
                 resource.temperature = min(90.0, round(resource.temperature + 30.0, 1))
@@ -266,7 +289,6 @@ class ScoutAndForagerBee:
         authors: list[str] = None,
         is_mainstream: bool = False
     ):
-        """Склейка сигналов с разных сайтов по вектору семантического ядра ИЛИ пересечению >= 2 специфических корней"""
         dist_col = TrendMemory.embedding.cosine_distance(signal.embedding).label("dist")
         stmt = select(TrendMemory, dist_col).order_by(dist_col).limit(1)
         row = (await db.execute(stmt)).first()
@@ -288,6 +310,22 @@ class ScoutAndForagerBee:
         clean_title = (analysis or {}).get("title") or signal.signal_summary[:90]
         raw_essence = (analysis or {}).get("core_essence") or signal.signal_summary
 
+        # Подтягиваем предыдущие наблюдения этого же корня из матрицы кандидатов, если они были на других сайтах
+        initial_deltas = []
+        if not existing and signal.search_queries:
+            lead_st = signal.search_queries[0].lower()[:6]
+            prior_sightings = TrendMathEngine._candidate_sightings.get(lead_st, [])
+            for ps in prior_sightings[-4:]:
+                if ps["source"] != src_name:
+                    initial_deltas.append({
+                        "timestamp": datetime.fromtimestamp(ps["ts"], tz=timezone.utc).isoformat(),
+                        "date": datetime.fromtimestamp(ps["ts"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                        "source": ps["source"],
+                        "author": ps["author"],
+                        "geo": geo,
+                        "event": ps["text"][:240]
+                    })
+
         new_event = {
             "timestamp": now_iso,
             "date": utcnow().strftime("%Y-%m-%d %H:%M"),
@@ -299,20 +337,22 @@ class ScoutAndForagerBee:
 
         if not existing:
             count_all = len((await db.execute(select(TrendMemory.id))).scalars().all())
+            all_deltas = initial_deltas + [new_event]
+            note = get_multi_site_note(all_deltas)
             db.add(TrendMemory(
                 code=f"HIVE-{count_all + 1:04d}",
                 title=clean_title,
-                core_essence=raw_essence,
+                core_essence=f"{raw_essence}{note}",
                 keywords_multilang=signal.search_queries,
                 embedding=signal.embedding,
                 origin_geo=geo,
                 geo_spread=[geo],
-                lifecycle_status="MAINSTREAM_PRICED_IN" if is_mainstream else "CALIBRATING_BASELINE",
+                lifecycle_status="MAINSTREAM_PRICED_IN" if is_mainstream else ("ACCELERATING" if len(all_deltas) >= 2 else "CALIBRATING_BASELINE"),
                 is_in_mainstream_media=is_mainstream,
                 acceleration_rate=0.0,
                 velocity=0.0,
                 z_score=0.0,
-                delta_history=[new_event]
+                delta_history=all_deltas
             ))
         else:
             if existing.lifecycle_status == "IGNORED_NOISE":
@@ -339,9 +379,6 @@ class ScoutAndForagerBee:
         await db.commit()
 
 
-# =====================================================================
-# 2. ПЧЕЛИНАЯ КОРОЛЕВА (QUEEN BEE — БАЛАНС УЛЬЯ И ПРОГРЕВ НИЖНИХ РЕСУРСОВ)
-# =====================================================================
 class QueenBeeAgent:
     def __init__(self, controller: "SwarmController"):
         self.agent_id = "Пчелиная Королева"
@@ -374,9 +411,6 @@ class QueenBeeAgent:
             await asyncio.sleep(45)
 
 
-# =====================================================================
-# 3. ПЧЕЛА-СТРАЖ (GUARD BEE — ИММУНИТЕТ УЛЬЯ, ЧИСТКА ЛОКОВ И КОННЕКТОРОВ)
-# =====================================================================
 class GuardBeeAgent:
     def __init__(self, controller: "SwarmController"):
         self.agent_id = "Пчела-Страж"
@@ -416,9 +450,6 @@ class GuardBeeAgent:
             await asyncio.sleep(50)
 
 
-# =====================================================================
-# 4. ПЧЕЛА-ПРИЁМЩИЦА (RECEIVER BEE — МАТЕМАТИКА БАЗЫ, Z-SCORE И RAG-ЗАВИСИМОСТИ)
-# =====================================================================
 class ReceiverMathBeeAgent:
     def __init__(self, controller: "SwarmController"):
         self.agent_id = "Пчела-Приёмщица (Математика)"
@@ -432,7 +463,7 @@ class ReceiverMathBeeAgent:
                     if not trends:
                         await update_agent_telemetry(
                             db, self.agent_id, "ПРИЁМЩИЦА", "IDLE", "Соты Памяти (0)",
-                            "Ожидание первых подтвержденных сигналов..."
+                            "Ожидание подтвержденных межсайтовых сигналов..."
                         )
                         await asyncio.sleep(25)
                         continue
@@ -512,9 +543,6 @@ class ReceiverMathBeeAgent:
             await asyncio.sleep(30)
 
 
-# =====================================================================
-# КОНТРОЛЛЕР УЛЬЯ (ДИНАМИЧЕСКОЕ МАСШТАБИРОВАНИЕ 1..100 РАЗВЕДЧИЦ)
-# =====================================================================
 class SwarmController:
     def __init__(self):
         self.is_running = False
