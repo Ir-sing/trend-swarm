@@ -8,18 +8,28 @@ from datetime import datetime, timezone
 
 class TrendMathEngine:
     """
-    Чистое математическое ядро Проекта «Улей» (0 зашитых списков слов):
-    1) Динамический корпусный IDF (_global_doc_freq): любые слова, встречающиеся более чем в 15% проверенных
-       документов, автоматически признаются общим фоном языка и получают вес IDF = 0.0.
-    2) Буфер накопления кандидатов (_candidate_sightings): одиночная публикация на 1 сайте не вызывает модель (0 токенов)
-       и не создает карточку в БД. Сигнал рождается только при независимом появлении термина на >= 2 сайтах
-       или у >= 2 разных авторов.
-    3) Сравнение с Базой (calculate_kpis): если текущая частота упоминаний (c_now) не превышает среднюю базовую
-       частоту прошлых отрезков (rate_base), итоговое ускорение строго равно 0.0.
+    Математическое ядро Проекта «Улей»:
+    1) Прогревает частотную матрицу (_global_doc_freq) из БД при старте сервера (warmup_from_db),
+       чтобы фильтр IDF работал с первой же секунды после любого рестарта контейнера.
+    2) Отсекает общий фон языка по закону Ципфа (df / total_docs > 0.15 -> IDF = 0.0) без зашитых списков стоп-слов.
+    3) Фиксирует зарождение сигнала только при независимом появлении термина на >= 2 ресурсах или у >= 2 авторов.
+    4) Сравнивает текущую частоту (c_now) со средней базовой частотой прошлых отрезков (rate_base).
     """
     _total_docs_seen: int = 0
     _global_doc_freq: Counter = Counter()
     _candidate_sightings: dict[str, list[dict]] = {}
+
+    @classmethod
+    def warmup_from_db(cls, existing_texts: list[str]):
+        """Восстанавливает матрицу IDF из существующих записей БД при старте контейнера"""
+        if cls._total_docs_seen > 0 or not existing_texts:
+            return
+        for txt in existing_texts:
+            stems = {w[:5] for w in re.findall(r"\b[a-zа-яё]{5,}\b", (txt or "").lower()) if not w.isdigit()}
+            if stems:
+                cls._total_docs_seen += 1
+                for st in stems:
+                    cls._global_doc_freq[st] += 1
 
     @classmethod
     def get_stem_idf(cls, stem: str) -> float:
@@ -112,7 +122,6 @@ class TrendMathEngine:
 
                 unique_sites = {s["source"] for s in sightings}
                 unique_authors = {s["author"] for s in sightings}
-                # Явление выходит из буфера только при независимом появлении на >= 2 сайтах ИЛИ у >= 2 авторов
                 if len(unique_sites) >= 2 or (len(sightings) >= 2 and len(unique_authors) >= 2):
                     emerged_scores[st] = len(unique_sites) * idf_w + len(unique_authors) * 0.5
 
@@ -207,7 +216,6 @@ class TrendMathEngine:
         author_diversity = min(1.0, max(0.25, unique_cnt / len(events)))
         cross_site_bonus = 1.0 + (sites_count - 1) * 0.5
 
-        # Если текущая частота не превышает базовую и 2-я производная <= 0 — ускорения нет (0.0)
         if c_now <= rate_base and acceleration <= 0:
             composite = 0.0
         else:
