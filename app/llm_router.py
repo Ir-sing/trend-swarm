@@ -5,14 +5,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from litellm import acompletion
 from app.models import AgentRoleConfig, ConnectorCredential
 from app.math_engine import TrendMathEngine
-from app.connectors import ResourceConnectorEngine
 
 class DynamicModelRouter:
     @classmethod
     async def ask_agent(cls, db: AsyncSession, role_name: str, user_payload: str, raw_items: list[dict] = None, image_url: str = None) -> dict:
+        # ШАГ 1: Математический пред-фильтр ДО вызова нейросети (0 токенов!)
+        # Если мы проверяем сырые посты с сайта и в них нет ни одного маркера сдвига поведения/инвестиций —
+        # мы НЕ вызываем модель вообще (экономия 90% токенов и времени GPU/CPU)
+        extracted = None
+        if raw_items is not None:
+            extracted = TrendMathEngine.extract_clean_facts_and_terms(raw_items)
+            if not extracted.get("has_signal"):
+                return {"is_anomaly": False, "confirmed": False}
+            # Вместо простыни на 2500 символов передаем в модель только выжатый релевантный пост (до 360 символов!)
+            user_payload = extracted.get("compact_payload", user_payload[:600])
+
         cfg = (await db.execute(select(AgentRoleConfig).where(AgentRoleConfig.role_name == role_name))).scalars().first()
         if not cfg:
-            return {"is_anomaly": False}
+            return {"is_anomaly": False, "confirmed": False}
 
         cred = (await db.execute(select(ConnectorCredential).where(ConnectorCredential.service_name == cfg.credential_service))).scalars().first()
         token_or_url = cred.api_key_or_token.strip() if (cred and cred.api_key_or_token) else ""
@@ -25,36 +35,24 @@ class DynamicModelRouter:
         elif token_or_url:
             api_key = token_or_url
 
+        # ШАГ 2: Вызов локальной модели (Ollama / vLLM / Hermes) или внешнего API на сжатом контексте (~150-200 токенов)
         if cfg.provider in ("ollama", "vllm", "openai_compatible") or api_key or api_base:
             try:
-                messages = [{"role": "system", "content": cfg.system_prompt}]
-                if image_url:
-                    # Для локальных моделей (Ollama llava / qwen2.5-vl) переводим превью картинки/видео в base64!
-                    img_payload = image_url
-                    if cfg.provider in ("ollama", "vllm"):
-                        b64_img = await ResourceConnectorEngine.fetch_image_as_base64(image_url)
-                        if b64_img:
-                            img_payload = b64_img
-                    messages.append({
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": user_payload},
-                            {"type": "image_url", "image_url": {"url": img_payload}}
-                        ]
-                    })
-                else:
-                    messages.append({"role": "user", "content": user_payload})
-
+                messages = [
+                    {"role": "system", "content": cfg.system_prompt},
+                    {"role": "user", "content": user_payload[:750]}
+                ]
                 model_str = cfg.model_name
                 if cfg.provider not in model_str and cfg.provider in ("ollama", "openrouter", "openai"):
-                    model_str = f"{cfg.provider}/{cfg.model_name}"
+                    model_str = f"{cfg.provider}/{model_str}"
 
                 kwargs = {
                     "model": model_str,
                     "messages": messages,
                     "temperature": cfg.temperature,
+                    "max_tokens": 220,  # Ограничиваем длину ответа, чтобы модель не лила воду
                     "response_format": {"type": "json_object"},
-                    "timeout": 25.0
+                    "timeout": 20.0
                 }
                 if api_base:
                     kwargs["api_base"] = api_base
@@ -64,24 +62,24 @@ class DynamicModelRouter:
                     kwargs["api_key"] = api_key
 
                 resp = await acompletion(**kwargs)
-                return json.loads(resp.choices[0].message.content)
+                parsed = json.loads(resp.choices[0].message.content)
+                if isinstance(parsed, dict) and parsed.get("title"):
+                    return parsed
             except Exception:
                 pass
 
-        # Математический экстрактор (сохраняет найденные картинки, мемы и видео даже без запущенной VLM)
-        if raw_items:
-            extracted = TrendMathEngine.extract_clean_facts_and_terms(raw_items)
-            if extracted.get("has_signal"):
-                return {
-                    "is_anomaly": True,
-                    "confirmed": True,
-                    "title": extracted["title"],
-                    "essence": extracted["essence"],
-                    "core_essence": extracted["essence"],
-                    "delta_summary": extracted["essence"],
-                    "summary": extracted["essence"],
-                    "multilang_keywords": extracted["keywords"]
-                }
+        # ШАГ 3: Если локальная модель сейчас не запущена — возвращаем чистый результат математического экстрактора
+        if extracted and extracted.get("has_signal"):
+            return {
+                "is_anomaly": True,
+                "confirmed": True,
+                "title": extracted["title"],
+                "essence": extracted["essence"],
+                "core_essence": extracted["essence"],
+                "delta_summary": extracted["essence"],
+                "summary": extracted["essence"],
+                "multilang_keywords": extracted["keywords"]
+            }
 
         return {"is_anomaly": False, "confirmed": False}
 
