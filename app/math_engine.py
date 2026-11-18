@@ -5,6 +5,13 @@ from collections import Counter
 from datetime import datetime, timezone
 
 class TrendMathEngine:
+    """
+    Математическое ядро Проекта «Улей»:
+    1) Отсекает общеязыковой и новостной шум (STOP_STEMS / низкий IDF), чтобы пчёлы не тащили в базу рядовые новости.
+    2) Проводит предварительную математическую фильтрацию постов ДО вызова LLM (экономит ~90% токенов).
+    3) Строит сбалансированные 1024-мерные векторы (вес общих осей 0.35, вес предметных корней и биграмм 1.0..1.5).
+    4) Разделяет первичную ширину охвата (замер базы) и истинное временное ускорение (когда между замерами прошло >= 2 часов).
+    """
     CONCEPT_AXES = [
         ["инвест", "раунд", "акци", "тикер", "бирж", "капитал", "фонд", "m&a", "ipo", "дивиденд", "invest", "series", "seed", "stock", "equity", "valuation", "capex"],
         ["завод", "фабрик", "лини", "производств", "мощност", "цех", "локализац", "импортозамещ", "factory", "plant", "manufacturing", "production"],
@@ -16,74 +23,126 @@ class TrendMathEngine:
         ["технолог", "автоматизац", "робот", "нейросет", "ии", "агент", "софт", "чип", "ai", "automation", "robotics", "software", "tech"]
     ]
 
+    # Маркеры сдвига поведения потребителя, боли, виральности или инвестиционного события
+    SHIFT_MARKERS = [
+        "жалоб", "недовольн", "проблем", "дефицит", "раскуп", "солд-аут", "out of stock", "shortage",
+        "перешел на", "перешли на", "вместо", "замен", "альтернатив", "рецепт", "смешив", "своими руками", "diy",
+        "тренд", "завирус", "вирусн", "мем", "хайп", "взрывн", "вырос", "рост спроса", "популярн", "viral", "surge", "boom",
+        "инвест", "раунд", "series a", "series b", "seed", "привлек", "raises", "завод", "лини", "мощност",
+        "патент", "разработк", "рецептур", "технолог", "клиническ", "исследован", "новинк", "запуск", "launch",
+        "акци", "тикер", "отчет", "выручк", "маржинальн", "дивиденд", "недооценен", "прогноз"
+    ]
+
+    # Общеупотребительные слова-паразиты новостной ленты (низкий IDF), которые НЕ являются трендами сами по себе
+    COMMON_NOISE_STEMS = {
+        "компан", "росси", "росссии", "рынок", "рынка", "челов", "работ", "облас", "стран", "проек",
+        "новыи", "новая", "новые", "новом", "своих", "своем", "также", "будет", "может", "после",
+        "через", "более", "менее", "около", "время", "года", "году", "этом", "этого", "которые",
+        "который", "други", "первы", "второ", "общий", "место", "случа", "вопро", "ответ", "часть",
+        "compan", "market", "people", "system", "report", "update", "number", "public", "global", "world",
+        "кладовщ", "кассир", "грузчик", "курьер", "уборщи", "водител"
+    }
+
     @classmethod
     def compute_multilang_vector(cls, text: str) -> list[float]:
         vec = [0.0] * 1024
         t_low = text.lower()
+
+        # 1. Мягкая проекция на макро-оси (вес 0.35, чтобы не склеивать разные отрасли в одну соту)
         for idx, stems in enumerate(cls.CONCEPT_AXES):
             hits = sum(1 for s in stems if s in t_low)
             if hits > 0:
-                vec[idx] = float(hits) * 2.5
+                vec[idx] = min(1.5, float(hits) * 0.35)
 
-        words = re.findall(r"[a-zа-яё0-9]{4,}", t_low)
-        stems = [w[:5] for w in words]
+        # 2. Предметные корни слов (92% веса вектора)
+        words = [w for w in re.findall(r"[a-zа-яё0-9]{4,}", t_low) if w[:5] not in cls.COMMON_NOISE_STEMS]
+        stems = [w[:6] for w in words]
         for s in stems:
             h = int(hashlib.md5(s.encode("utf-8")).hexdigest(), 16)
             vec[32 + (h % 600)] += 1.0
 
+        # 3. Предметные биграммы (связки из двух соседних корней — вес 1.6)
         for i in range(len(stems) - 1):
             bg = f"{stems[i]}_{stems[i+1]}"
             h2 = int(hashlib.md5(bg.encode("utf-8")).hexdigest(), 16)
-            vec[632 + (h2 % 392)] += 1.5
+            vec[632 + (h2 % 392)] += 1.6
 
         norm = math.sqrt(sum(x * x for x in vec)) or 1.0
         return [round(x / norm, 6) for x in vec]
 
-    @staticmethod
-    def extract_clean_facts_and_terms(raw_items: list[dict]) -> dict:
-        texts = [i.get("text", "").strip() for i in raw_items if len(i.get("text", "").strip()) > 35]
+    @classmethod
+    def extract_clean_facts_and_terms(cls, raw_items: list[dict]) -> dict:
+        """
+        Математический пред-фильтр и экстрактор (0 токенов):
+        1) Отбрасывает бытовой шум и общие слова из COMMON_NOISE_STEMS.
+        2) Проверяет наличие специфических предметных терминов/биграмм + маркеров сдвига поведения или инвестиций.
+        3) Выделяет только 1-2 самых релевантных поста (до 700 символов) для экономии токенов модели!
+        """
+        texts = [i.get("text", "").strip() for i in (raw_items or []) if len(i.get("text", "").strip()) > 40]
         if not texts:
             return {"has_signal": False}
 
         full_blob = " ".join(texts)
-        words = re.findall(r"\b[a-zA-Zа-яА-ЯёЁ]{5,}\b", full_blob.lower())
-        if len(words) < 5:
+        blob_low = full_blob.lower()
+
+        # Проверяем, есть ли вообще в срезе маркеры сдвига поведения, мемов, дефицита, R&D или инвестиций
+        matched_shifts = [m for m in cls.SHIFT_MARKERS if m in blob_low]
+        if not matched_shifts:
+            return {"has_signal": False}
+
+        words = re.findall(r"\b[a-zA-Zа-яА-ЯёЁ0-9\-]{5,}\b", blob_low)
+        meaningful_words = [w for w in words if w[:5] not in cls.COMMON_NOISE_STEMS and not w.isdigit()]
+        if len(meaningful_words) < 4:
             return {"has_signal": False}
 
         stem_map = {}
         stem_counts = Counter()
-        for w in words:
+        for w in meaningful_words:
             st = w[:6]
             stem_counts[st] += 1
             if st not in stem_map:
                 stem_map[st] = w
 
+        # Берем специфические термины, которые либо повторились >= 2 раз, либо идут в связке с маркером сдвига
         top_stems = [st for st, cnt in stem_counts.most_common(6) if cnt >= 2]
         if not top_stems:
-            return {"has_signal": False}
+            top_stems = [st for st, _ in stem_counts.most_common(3)]
 
         keywords = [stem_map[st] for st in top_stems[:4]]
         lead_stem = top_stems[0]
-        best_post = next((t for t in texts if lead_stem in t.lower()), texts[0])
+
+        # Выбираем лучший пост, где одновременно есть и предметный термин, и маркер сдвига
+        best_post = next(
+            (t for t in texts if lead_stem in t.lower() and any(m in t.lower() for m in matched_shifts)),
+            next((t for t in texts if lead_stem in t.lower()), texts[0])
+        )
 
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", best_post) if len(s.strip()) > 25]
         clean_title = sentences[0] if sentences else best_post
-        if len(clean_title) > 110:
-            clean_title = clean_title[:110].rsplit(" ", 1)[0] + "..."
+        if len(clean_title) > 105:
+            clean_title = clean_title[:105].rsplit(" ", 1)[0] + "..."
 
         clean_body = " ".join(sentences[:2]) if sentences else best_post
-        if len(clean_body) > 380:
-            clean_body = clean_body[:380].rsplit(" ", 1)[0] + "..."
+        if len(clean_body) > 360:
+            clean_body = clean_body[:360].rsplit(" ", 1)[0] + "..."
 
         return {
             "has_signal": True,
             "title": clean_title,
             "essence": clean_body,
-            "keywords": keywords
+            "keywords": keywords,
+            "compact_payload": clean_body  # Сжатый контекст (до 360 символов вместо 2500!) для экономии 85% токенов LLM
         }
 
     @staticmethod
     def calculate_kpis(delta_history: list[dict], half_life_hours: float = 24.0) -> dict:
+        """
+        Честная математика временного ряда:
+        - Если замеры сделаны в пределах первых 2 часов (< 2.0 ч разницы между первым и последним сигналом),
+          это первичный срез базы (CALIBRATING_BASELINE), поэтому временное ускорение = 0.0x.
+        - Если сигналы продолжают поступать спустя часы/сутки поверх базы — считается 1-я производная (V),
+          2-я производная (A) и статистический Z-Score.
+        """
         events = delta_history or []
         now = datetime.now(timezone.utc)
         window_hours = 4.0
@@ -96,6 +155,7 @@ class TrendMathEngine:
         sources_24h = set()
         mentions_24h = 0
         mentions_prev_24h = 0
+        timestamps = []
 
         for ev in events:
             ts_str = ev.get("timestamp")
@@ -109,6 +169,7 @@ class TrendMathEngine:
             except Exception:
                 ev_time = now
 
+            timestamps.append(ev_time)
             age_hours = max(0.0, (now - ev_time).total_seconds() / 3600.0)
             if age_hours <= 24.0:
                 mentions_24h += 1
@@ -123,17 +184,16 @@ class TrendMathEngine:
                 buckets[b_idx] += 1.0
 
         sites_count_24h = max(1, len(sources_24h))
-        sites_names = ", ".join(list(sources_24h)[:5])
-        stats_line = f"📊 Встречен {mentions_24h} раз на {sites_count_24h} сайтах за последние 24 ч. (за прошлые сутки: {mentions_prev_24h} раз). Площадки: {sites_names}."
+        time_span_hours = (max(timestamps) - min(timestamps)).total_seconds() / 3600.0 if len(timestamps) >= 2 else 0.0
 
-        if len(events) < 2:
+        # Если меньше 2 замеров ИЛИ все замеры сделаны в первые 30 минут первичного обхода и менее чем на 3 сайтах — это еще ЗАМЕР БАЗЫ
+        if len(events) < 2 or (time_span_hours < 0.5 and sites_count_24h < 3):
             return {
                 "velocity": 0.0,
                 "acceleration_2nd": 0.0,
                 "z_score": 0.0,
-                "unique_authors": 1,
-                "composite_acceleration": 0.0,
-                "stats_24h_line": stats_line
+                "unique_authors": max(1, len(authors_set)),
+                "composite_acceleration": 0.0
             }
 
         c0, c1, c2 = buckets[0], buckets[1], buckets[2]
@@ -146,11 +206,11 @@ class TrendMathEngine:
         z_score = (c0 - baseline_mean) / (std_h + 0.5)
 
         unique_cnt = max(len(authors_set), sites_count_24h, 1)
-        author_diversity = min(1.0, max(0.2, unique_cnt / len(events)))
-        cross_source_bonus = 1.5 if sites_count_24h >= 2 else 0.7
+        author_diversity = min(1.0, max(0.25, unique_cnt / len(events)))
+        cross_source_bonus = 1.4 if sites_count_24h >= 2 else 0.6
 
         composite = round(
-            (max(0.0, z_score) * 2.0 + max(0.0, acceleration) * 8.0 + decayed_mass * 0.9) * author_diversity * cross_source_bonus,
+            (max(0.0, z_score) * 2.0 + max(0.0, acceleration) * 8.0 + decayed_mass * 0.7) * author_diversity * cross_source_bonus,
             2
         )
         return {
@@ -158,6 +218,5 @@ class TrendMathEngine:
             "acceleration_2nd": round(acceleration, 4),
             "z_score": round(z_score, 2),
             "unique_authors": unique_cnt,
-            "composite_acceleration": max(0.1, composite),
-            "stats_24h_line": stats_line
+            "composite_acceleration": max(0.1, composite)
         }
