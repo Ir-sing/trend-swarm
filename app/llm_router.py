@@ -3,13 +3,12 @@ import re
 import json
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from litellm import acompletion
+from litellm import acompletion, aembedding
 from app.models import AgentRoleConfig, ConnectorCredential
 from app.math_engine import TrendMathEngine
 
 
 def safe_parse_llm_json(raw_str: str) -> dict:
-    """Надежно извлекает JSON-объект из ответа даже маленьких локальных моделей (убирает обёртки ```json ... ```)"""
     if not raw_str:
         return {}
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_str.strip(), flags=re.IGNORECASE | re.MULTILINE)
@@ -25,27 +24,8 @@ def safe_parse_llm_json(raw_str: str) -> dict:
 
 
 class DynamicModelRouter:
-    @classmethod
-    async def ask_agent(
-        cls,
-        db: AsyncSession,
-        role_name: str,
-        user_payload: str,
-        raw_items: list[dict] = None,
-        source_name: str = "Source",
-        image_url: str = None
-    ) -> dict:
-        extracted = None
-        if raw_items is not None:
-            extracted = TrendMathEngine.extract_clean_facts_and_terms(raw_items, source_name=source_name)
-            if not extracted.get("has_signal"):
-                return {"is_anomaly": False, "confirmed": False}
-            user_payload = extracted.get("compact_payload", user_payload[:450])
-
-        cfg = (await db.execute(select(AgentRoleConfig).where(AgentRoleConfig.role_name == role_name))).scalars().first()
-        if not cfg:
-            return {"is_anomaly": False, "confirmed": False}
-
+    @staticmethod
+    async def _resolve_connection(db: AsyncSession, cfg: AgentRoleConfig) -> tuple[str | None, str | None]:
         cred = (await db.execute(select(ConnectorCredential).where(ConnectorCredential.service_name == cfg.credential_service))).scalars().first()
         token_or_url = cred.api_key_or_token.strip() if (cred and cred.api_key_or_token) else ""
 
@@ -57,54 +37,93 @@ class DynamicModelRouter:
         elif token_or_url:
             api_key = token_or_url
 
-        if cfg.provider in ("ollama", "vllm", "openai_compatible") or api_key or api_base:
-            try:
-                messages = [
-                    {"role": "system", "content": cfg.system_prompt},
-                    {"role": "user", "content": user_payload[:550]}
-                ]
-                model_str = cfg.model_name
-                if cfg.provider not in model_str and cfg.provider in ("ollama", "openrouter", "openai"):
-                    model_str = f"{cfg.provider}/{model_str}"
+        if not api_base and cfg.provider == "ollama":
+            api_base = "http://host.docker.internal:11434"
+        return api_base, api_key
 
-                kwargs = {
-                    "model": model_str,
-                    "messages": messages,
-                    "temperature": cfg.temperature,
-                    "max_tokens": 180,
-                    "response_format": {"type": "json_object"},
-                    "timeout": 20.0
-                }
-                if api_base:
-                    kwargs["api_base"] = api_base
-                elif cfg.provider == "ollama":
-                    kwargs["api_base"] = "http://host.docker.internal:11434"
-                if api_key:
-                    kwargs["api_key"] = api_key
+    @classmethod
+    async def get_semantic_embedding(cls, db: AsyncSession, text: str) -> list[float]:
+        """
+        Получает плотный 1024-мерный мультиязычный вектор (bge-m3 через настраиваемую роль embedder).
+        Если локальный нейро-эмбеддер недоступен — строит морфологический 3/4-граммный вектор (без потери размерности).
+        """
+        clean_txt = (text or "").strip()[:1200]
+        if not clean_txt:
+            return [0.0] * 1024
 
-                resp = await acompletion(**kwargs)
-                parsed = safe_parse_llm_json(resp.choices[0].message.content)
-                if parsed and (parsed.get("title") or parsed.get("investment_or_product_thesis")):
-                    if not parsed.get("multilang_keywords") and extracted:
-                        parsed["multilang_keywords"] = extracted["keywords"]
-                    return parsed
-            except Exception:
-                pass
+        cfg = (await db.execute(select(AgentRoleConfig).where(AgentRoleConfig.role_name == "embedder"))).scalars().first()
+        if cfg:
+            api_base, api_key = await cls._resolve_connection(db, cfg)
+            if cfg.provider in ("ollama", "vllm", "openai_compatible") or api_key:
+                try:
+                    model_str = cfg.model_name
+                    if cfg.provider not in model_str and cfg.provider in ("ollama", "openrouter", "openai"):
+                        model_str = f"{cfg.provider}/{model_str}"
+                    kwargs = {"model": model_str, "input": [clean_txt], "timeout": 12.0}
+                    if api_base:
+                        kwargs["api_base"] = api_base
+                    if api_key:
+                        kwargs["api_key"] = api_key
+                    resp = await aembedding(**kwargs)
+                    vec = resp.data[0]["embedding"]
+                    if len(vec) == 1024:
+                        return vec
+                    elif len(vec) < 1024:
+                        return vec + [0.0] * (1024 - len(vec))
+                    else:
+                        return vec[:1024]
+                except Exception:
+                    pass
 
-        if extracted and extracted.get("has_signal"):
-            return {
-                "is_anomaly": True,
-                "confirmed": True,
-                "title": extracted["title"],
-                "essence": extracted["essence"],
-                "core_essence": extracted["essence"],
-                "delta_summary": extracted["essence"],
-                "summary": extracted["essence"],
-                "multilang_keywords": extracted["keywords"]
+        return TrendMathEngine.compute_char_ngram_vector(clean_txt)
+
+    @classmethod
+    async def ask_agent(
+        cls,
+        db: AsyncSession,
+        role_name: str,
+        user_payload: str
+    ) -> dict:
+        """
+        Отправляет текст напрямую нейросети заданной роли (без отсечения по отдельным словам!).
+        Принимает любой валидный JSON-ответ (включая решения Королевы {"boost_block": ...}).
+        """
+        cfg = (await db.execute(select(AgentRoleConfig).where(AgentRoleConfig.role_name == role_name))).scalars().first()
+        if not cfg:
+            return {"llm_online": False}
+
+        api_base, api_key = await cls._resolve_connection(db, cfg)
+        if cfg.provider not in ("ollama", "vllm", "openai_compatible") and not api_key:
+            return {"llm_online": False}
+
+        try:
+            messages = [
+                {"role": "system", "content": cfg.system_prompt},
+                {"role": "user", "content": user_payload[:2200]}
+            ]
+            model_str = cfg.model_name
+            if cfg.provider not in model_str and cfg.provider in ("ollama", "openrouter", "openai"):
+                model_str = f"{cfg.provider}/{model_str}"
+
+            kwargs = {
+                "model": model_str,
+                "messages": messages,
+                "temperature": cfg.temperature,
+                "max_tokens": 320,
+                "response_format": {"type": "json_object"},
+                "timeout": 30.0
             }
+            if api_base:
+                kwargs["api_base"] = api_base
+            if api_key:
+                kwargs["api_key"] = api_key
 
-        return {"is_anomaly": False, "confirmed": False}
+            resp = await acompletion(**kwargs)
+            parsed = safe_parse_llm_json(resp.choices[0].message.content)
+            if parsed:
+                parsed["llm_online"] = True
+                return parsed
+        except Exception as e:
+            return {"llm_online": False, "error": str(e)[:120]}
 
-    @staticmethod
-    def compute_fast_vector(text: str) -> list[float]:
-        return TrendMathEngine.compute_multilang_vector(text)
+        return {"llm_online": False}
