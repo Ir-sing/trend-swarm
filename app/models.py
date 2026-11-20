@@ -4,8 +4,10 @@ from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
 from app.database import Base
 
+
 def utcnow():
     return datetime.now(timezone.utc)
+
 
 class ConnectorCredential(Base):
     __tablename__ = "connector_credentials"
@@ -14,6 +16,7 @@ class ConnectorCredential(Base):
     api_key_or_token = Column(Text, default="")
     extra_headers = Column(JSON, default={})
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
 
 class AgentTelemetry(Base):
     __tablename__ = "agent_telemetry"
@@ -24,6 +27,7 @@ class AgentTelemetry(Base):
     current_action = Column(Text, default="Ожидание запуска")
     items_processed = Column(Integer, default=0)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
 
 class AgentRoleConfig(Base):
     __tablename__ = "agent_role_configs"
@@ -36,6 +40,7 @@ class AgentRoleConfig(Base):
     temperature = Column(Float, default=0.2)
     system_prompt = Column(Text, nullable=False)
 
+
 class SemanticBlock(Base):
     __tablename__ = "semantic_blocks"
     id = Column(Integer, primary_key=True)
@@ -43,6 +48,7 @@ class SemanticBlock(Base):
     block_type = Column(String, nullable=False)
     description = Column(Text)
     resources = relationship("Resource", back_populates="block")
+
 
 class Resource(Base):
     __tablename__ = "resources"
@@ -66,6 +72,7 @@ class Resource(Base):
     last_error = Column(Text, nullable=True)
     block = relationship("SemanticBlock", back_populates="resources")
 
+
 class SwarmBlackboard(Base):
     __tablename__ = "swarm_blackboard"
     id = Column(Integer, primary_key=True)
@@ -79,6 +86,22 @@ class SwarmBlackboard(Base):
     confirmations = Column(JSON, default=[])
     priority_boost = Column(Float, default=1.0)
     status = Column(String, default="ACTIVE")
+
+
+# СКРЫТАЯ БАЗА ФОНОВЫХ НАБЛЮДЕНИЙ И СОБЫТИЙ НУЛЕВОЙ ЧАСТОТЫ (Baseline)
+class BaselineObservation(Base):
+    __tablename__ = "baseline_observations"
+    id = Column(Integer, primary_key=True)
+    observed_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+    phenomenon_title = Column(String, nullable=False)
+    phenomenon_essence = Column(Text, nullable=False)
+    key_phrases = Column(JSON, default=[])
+    embedding = Column(Vector(1024), nullable=True)
+    source_name = Column(String, nullable=False)
+    author_id = Column(String, nullable=False)
+    geo_region = Column(String, default="GLOBAL")
+    is_promoted = Column(Boolean, default=False)
+
 
 class TrendMemory(Base):
     __tablename__ = "trend_memory"
@@ -101,6 +124,7 @@ class TrendMemory(Base):
     is_in_mainstream_media = Column(Boolean, default=False)
     delta_history = Column(JSON, default=[])
 
+
 class MetaInsight(Base):
     __tablename__ = "meta_insights"
     id = Column(Integer, primary_key=True)
@@ -112,12 +136,12 @@ class MetaInsight(Base):
     investment_or_product_thesis = Column(Text, nullable=False)
     confidence_score = Column(Float, default=0.75)
 
-# 8. ЖУРНАЛ ДЕЙСТВИЙ ПОЛЬЗОВАТЕЛЕЙ И ВНЕШНИХ СИСТЕМ (Audit Log)
+
 class UserAuditLog(Base):
     __tablename__ = "user_audit_logs"
     id = Column(Integer, primary_key=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
-    actor = Column(String, nullable=False)          # IP пользователя или "Hermes-Telegram-Bot"
-    action_type = Column(String, nullable=False)    # "SWARM_TOGGLE", "SCALE_BEES", "MODEL_EDIT", "HERMES_RAG_PULL" и т.д.
-    target = Column(String, nullable=False)         # Какой объект изменен
-    details = Column(Text, nullable=False)          # Подробности действия
+    actor = Column(String, nullable=False)
+    action_type = Column(String, nullable=False)
+    target = Column(String, nullable=False)
+    details = Column(Text, nullable=False)
